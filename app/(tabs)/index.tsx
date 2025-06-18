@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { StyleSheet, Alert, Platform } from 'react-native';
+import { StyleSheet, Alert, Platform, ScrollView } from 'react-native';
 import { Text, View } from '@/components/Themed';
 
 // Arduino device configuration
@@ -9,6 +9,29 @@ const DEVICE_CONFIG = {
   dataCharacteristicUUID: "780fe2ec-c87c-443e-bf01-78918d9d625b",
   commandCharacteristicUUID: "aa7e97b4-d7dc-4cb0-9fef-85875036520e"
 };
+
+// Types for sensor data
+interface SensorData {
+  timestamp: number;
+  sampleId: number;
+  accX: number;
+  accY: number;
+  accZ: number;
+  gyroX: number;
+  gyroY: number;
+  gyroZ: number;
+  recordingHash: string;
+}
+
+interface SessionData {
+  sessionHash: string;
+  startTime: number;
+  endTime?: number;
+  duration?: number;
+  sampleCount: number;
+  samples: SensorData[];
+  isActive: boolean;
+}
 
 export default function TabOneScreen() {
   const [bleSupported, setBleSupported] = useState<boolean | null>(null);
@@ -21,6 +44,32 @@ export default function TabOneScreen() {
   const [manager, setManager] = useState<any>(null);
   const [dataCharacteristic, setDataCharacteristic] = useState<any>(null);
   const [commandCharacteristic, setCommandCharacteristic] = useState<any>(null);
+
+  // Data reception state
+  const [currentSession, setCurrentSession] = useState<SessionData | null>(null);
+  const [latestSensorData, setLatestSensorData] = useState<SensorData | null>(null);
+  const [sessionHistory, setSessionHistory] = useState<SessionData[]>([]);
+  const [totalPacketsReceived, setTotalPacketsReceived] = useState(0);
+  const [dataRate, setDataRate] = useState(0); // packets per second
+  const [lastDataTime, setLastDataTime] = useState<number>(0);
+
+  // Data rate calculation
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const now = Date.now();
+      if (lastDataTime > 0 && now - lastDataTime < 2000) {
+        // Calculate packets per second based on recent activity
+        const timeDiff = (now - lastDataTime) / 1000;
+        if (currentSession && currentSession.samples.length > 0) {
+          setDataRate(Math.round(currentSession.samples.length / ((now - currentSession.startTime) / 1000)));
+        }
+      } else {
+        setDataRate(0);
+      }
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [lastDataTime, currentSession]);
 
   useEffect(() => {
     initializeBLE();
@@ -158,6 +207,11 @@ export default function TabOneScreen() {
         setCommandCharacteristic(null);
         setConnectionStatus('Disconnected');
         
+        // Clear current session on disconnect
+        if (currentSession?.isActive) {
+          setCurrentSession(prev => prev ? { ...prev, isActive: false } : null);
+        }
+        
         // Show disconnection alert
         Alert.alert(
           '📱 Device Disconnected',
@@ -218,8 +272,85 @@ export default function TabOneScreen() {
         const gyroZ = buffer.readInt16LE(16) / 10.0;
         const recordingHash = buffer.readUInt32LE(18);
 
-        // Log packet info (limit frequency to avoid spam)
-        if (sampleId % 50 === 0 || packetType !== 0x02) { // Log every 50th data packet or all non-data packets
+        const hashString = `0x${recordingHash.toString(16)}`;
+        const now = Date.now();
+
+        // Update total packets received
+        setTotalPacketsReceived(prev => prev + 1);
+        setLastDataTime(now);
+
+        // Handle different packet types
+        switch (packetType) {
+          case 0x01: // SESSION_START
+            console.log(`🎬 Gesture session started (Hash: ${hashString})`);
+            
+            // Create new session
+            const newSession: SessionData = {
+              sessionHash: hashString,
+              startTime: now,
+              sampleCount: 0,
+              samples: [],
+              isActive: true
+            };
+            
+            setCurrentSession(newSession);
+            break;
+
+          case 0x02: // SENSOR_DATA
+            // Create sensor data object
+            const sensorData: SensorData = {
+              timestamp,
+              sampleId,
+              accX,
+              accY,
+              accZ,
+              gyroX,
+              gyroY,
+              gyroZ,
+              recordingHash: hashString
+            };
+
+            // Update latest sensor data for real-time display
+            setLatestSensorData(sensorData);
+
+            // Add to current session if active
+            if (currentSession?.isActive && currentSession.sessionHash === hashString) {
+              setCurrentSession(prev => {
+                if (!prev) return null;
+                return {
+                  ...prev,
+                  sampleCount: prev.sampleCount + 1,
+                  samples: [...prev.samples, sensorData]
+                };
+              });
+            }
+            break;
+
+          case 0x03: // SESSION_END
+            console.log(`🎬 Gesture session ended (Duration: ${timestamp}ms, Samples: ${sampleId + 1})`);
+            
+            // Finalize current session
+            if (currentSession?.isActive && currentSession.sessionHash === hashString) {
+              const finalizedSession: SessionData = {
+                ...currentSession,
+                endTime: now,
+                duration: timestamp,
+                sampleCount: sampleId + 1,
+                isActive: false
+              };
+
+              setCurrentSession(finalizedSession);
+              
+              // Add to session history
+              setSessionHistory(prev => [finalizedSession, ...prev.slice(0, 9)]); // Keep last 10 sessions
+              
+              console.log(`📊 Session completed: ${finalizedSession.samples.length} samples collected`);
+            }
+            break;
+        }
+
+        // Log packet info occasionally to avoid spam
+        if (sampleId % 100 === 0 || packetType !== 0x02) {
           const packetTypeNames = {
             0x01: 'SESSION_START',
             0x02: 'SENSOR_DATA',
@@ -230,25 +361,12 @@ export default function TabOneScreen() {
             type: packetType,
             timestamp,
             sampleId,
-            hash: `0x${recordingHash.toString(16)}`,
+            hash: hashString,
             ...(packetType === 0x02 && {
               acc: { x: accX.toFixed(3), y: accY.toFixed(3), z: accZ.toFixed(3) },
               gyro: { x: gyroX.toFixed(1), y: gyroY.toFixed(1), z: gyroZ.toFixed(1) }
             })
           });
-        }
-
-        // Handle different packet types
-        switch (packetType) {
-          case 0x01: // SESSION_START
-            console.log(`🎬 Gesture session started (Hash: 0x${recordingHash.toString(16)})`);
-            break;
-          case 0x02: // SENSOR_DATA
-            // Real-time sensor data - could be processed here
-            break;
-          case 0x03: // SESSION_END
-            console.log(`🎬 Gesture session ended (Duration: ${timestamp}ms, Samples: ${sampleId + 1})`);
-            break;
         }
       } else {
         console.log('Received BLE data with unexpected length:', buffer.length);
@@ -351,6 +469,13 @@ export default function TabOneScreen() {
     }
   };
 
+  const clearSessionHistory = () => {
+    setSessionHistory([]);
+    setTotalPacketsReceived(0);
+    setCurrentSession(null);
+    setLatestSensorData(null);
+  };
+
   const getStatusColor = () => {
     if (bleSupported === false) return '#FF5722'; // Red
     if (connectedDevice) return '#4CAF50'; // Green
@@ -393,7 +518,7 @@ export default function TabOneScreen() {
   };
 
   return (
-    <View style={styles.container}>
+    <ScrollView style={styles.container} contentContainerStyle={styles.contentContainer}>
       <Text style={styles.title}>Abracadabra App</Text>
       
       <View style={[styles.statusContainer, { backgroundColor: getStatusColor() }]}>
@@ -443,12 +568,88 @@ export default function TabOneScreen() {
         </View>
       )}
 
+      {/* Real-time Data Display */}
+      {connectedDevice && (
+        <View style={styles.dataContainer}>
+          <Text style={styles.dataTitle}>📊 Live Data Stream</Text>
+          
+          <View style={styles.statsRow}>
+            <Text style={styles.statText}>Packets: {totalPacketsReceived}</Text>
+            <Text style={styles.statText}>Rate: {dataRate} Hz</Text>
+          </View>
+
+          {currentSession?.isActive && (
+            <View style={styles.sessionInfo}>
+              <Text style={styles.sessionTitle}>🎬 Recording Session</Text>
+              <Text style={styles.sessionText}>Hash: {currentSession.sessionHash}</Text>
+              <Text style={styles.sessionText}>Samples: {currentSession.sampleCount}</Text>
+              <Text style={styles.sessionText}>Duration: {Math.round((Date.now() - currentSession.startTime) / 1000)}s</Text>
+            </View>
+          )}
+
+          {latestSensorData && (
+            <View style={styles.sensorData}>
+              <Text style={styles.sensorTitle}>Latest Sensor Reading:</Text>
+              <View style={styles.sensorRow}>
+                <Text style={styles.sensorLabel}>Accel:</Text>
+                <Text style={styles.sensorValue}>
+                  X: {latestSensorData.accX.toFixed(3)}g
+                </Text>
+                <Text style={styles.sensorValue}>
+                  Y: {latestSensorData.accY.toFixed(3)}g
+                </Text>
+                <Text style={styles.sensorValue}>
+                  Z: {latestSensorData.accZ.toFixed(3)}g
+                </Text>
+              </View>
+              <View style={styles.sensorRow}>
+                <Text style={styles.sensorLabel}>Gyro:</Text>
+                <Text style={styles.sensorValue}>
+                  X: {latestSensorData.gyroX.toFixed(1)}°/s
+                </Text>
+                <Text style={styles.sensorValue}>
+                  Y: {latestSensorData.gyroY.toFixed(1)}°/s
+                </Text>
+                <Text style={styles.sensorValue}>
+                  Z: {latestSensorData.gyroZ.toFixed(1)}°/s
+                </Text>
+              </View>
+            </View>
+          )}
+        </View>
+      )}
+
+      {/* Session History */}
+      {sessionHistory.length > 0 && (
+        <View style={styles.historyContainer}>
+          <View style={styles.historyHeader}>
+            <Text style={styles.historyTitle}>📝 Session History</Text>
+            <Text style={styles.clearButton} onPress={clearSessionHistory}>
+              🗑️ Clear
+            </Text>
+          </View>
+          
+          {sessionHistory.slice(0, 3).map((session, index) => (
+            <View key={session.sessionHash} style={styles.historyItem}>
+              <Text style={styles.historyText}>
+                Session {index + 1}: {session.sampleCount} samples
+              </Text>
+              <Text style={styles.historySubtext}>
+                Duration: {session.duration}ms | Hash: {session.sessionHash}
+              </Text>
+            </View>
+          ))}
+        </View>
+      )}
+
       <View style={styles.instructions}>
         <Text style={styles.instructionText}>
           {bleSupported === false 
             ? '🔧 Create development build to use Bluetooth'
             : connectedDevice 
-              ? '🎉 Ready to receive gesture data! Double-tap your Arduino to start recording.' 
+              ? currentSession?.isActive
+                ? '🔴 Recording in progress... Perform your gesture!'
+                : '🎉 Ready to receive gesture data! Double-tap your Arduino to start recording.' 
               : isConnecting
                 ? '⏳ Connecting to your Arduino device...'
                 : foundDevice
@@ -463,13 +664,15 @@ export default function TabOneScreen() {
         <Text style={styles.configText}>Device: {DEVICE_CONFIG.name}</Text>
         <Text style={styles.configText}>Service: {DEVICE_CONFIG.serviceUUID}</Text>
       </View>
-    </View>
+    </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
+  },
+  contentContainer: {
     alignItems: 'center',
     justifyContent: 'center',
     padding: 20,
@@ -566,6 +769,126 @@ const styles = StyleSheet.create({
     borderRadius: 6,
     marginTop: 10,
     fontWeight: '600',
+  },
+  dataContainer: {
+    backgroundColor: '#1a2a1a',
+    padding: 15,
+    borderRadius: 10,
+    marginBottom: 20,
+    minWidth: 300,
+    borderWidth: 1,
+    borderColor: '#4CAF50',
+  },
+  dataTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginBottom: 10,
+    textAlign: 'center',
+    color: '#4CAF50',
+  },
+  statsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    marginBottom: 10,
+  },
+  statText: {
+    fontSize: 12,
+    color: '#9BA1A6',
+    fontFamily: 'monospace',
+  },
+  sessionInfo: {
+    backgroundColor: '#2a1a2a',
+    padding: 10,
+    borderRadius: 8,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: '#FF9800',
+  },
+  sessionTitle: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#FF9800',
+    marginBottom: 5,
+  },
+  sessionText: {
+    fontSize: 12,
+    color: '#ECEDEE',
+    fontFamily: 'monospace',
+    marginBottom: 2,
+  },
+  sensorData: {
+    backgroundColor: '#1a1a2a',
+    padding: 10,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#2196F3',
+  },
+  sensorTitle: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#2196F3',
+    marginBottom: 5,
+  },
+  sensorRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 3,
+  },
+  sensorLabel: {
+    fontSize: 12,
+    color: '#9BA1A6',
+    width: 50,
+    fontWeight: 'bold',
+  },
+  sensorValue: {
+    fontSize: 11,
+    color: '#ECEDEE',
+    fontFamily: 'monospace',
+    marginRight: 8,
+    minWidth: 70,
+  },
+  historyContainer: {
+    backgroundColor: '#2a2a1a',
+    padding: 15,
+    borderRadius: 10,
+    marginBottom: 20,
+    minWidth: 300,
+    borderWidth: 1,
+    borderColor: '#9BA1A6',
+  },
+  historyHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  historyTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#9BA1A6',
+  },
+  clearButton: {
+    fontSize: 12,
+    color: '#FF5722',
+    padding: 5,
+    backgroundColor: '#2a1a1a',
+    borderRadius: 4,
+  },
+  historyItem: {
+    backgroundColor: '#1a1a1a',
+    padding: 8,
+    borderRadius: 6,
+    marginBottom: 5,
+  },
+  historyText: {
+    fontSize: 12,
+    color: '#ECEDEE',
+    fontWeight: 'bold',
+  },
+  historySubtext: {
+    fontSize: 10,
+    color: '#9BA1A6',
+    fontFamily: 'monospace',
   },
   instructions: {
     marginTop: 20,
