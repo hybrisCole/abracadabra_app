@@ -14,8 +14,13 @@ export default function TabOneScreen() {
   const [bleSupported, setBleSupported] = useState<boolean | null>(null);
   const [isScanning, setIsScanning] = useState(false);
   const [foundDevice, setFoundDevice] = useState<any>(null);
+  const [connectedDevice, setConnectedDevice] = useState<any>(null);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState('Disconnected');
   const [scanStatus, setScanStatus] = useState('Initializing Bluetooth...');
   const [manager, setManager] = useState<any>(null);
+  const [dataCharacteristic, setDataCharacteristic] = useState<any>(null);
+  const [commandCharacteristic, setCommandCharacteristic] = useState<any>(null);
 
   useEffect(() => {
     initializeBLE();
@@ -65,6 +70,191 @@ export default function TabOneScreen() {
         return checkBluetoothState(bleManager, retryCount + 1);
       }
       return false;
+    }
+  };
+
+  const connectToDevice = async (device: any) => {
+    if (!manager || !device) {
+      console.log('Manager or device not available for connection');
+      return;
+    }
+
+    try {
+      setIsConnecting(true);
+      setConnectionStatus('Connecting...');
+      console.log('Attempting to connect to device:', device.id);
+
+      // Connect to the device
+      const connectedDevice = await device.connectWithTimeout(10000); // 10 second timeout
+      console.log('Connected to device:', connectedDevice.id);
+      
+      setConnectedDevice(connectedDevice);
+      setConnectionStatus('Connected - Discovering services...');
+
+      // Discover all services and characteristics
+      console.log('Discovering services and characteristics...');
+      await connectedDevice.discoverAllServicesAndCharacteristics();
+      
+      setConnectionStatus('Connected - Setting up notifications...');
+
+      // Get the gesture service
+      const services = await connectedDevice.services();
+      console.log('Available services:', services.map(s => s.uuid));
+      
+      const gestureService = services.find(service => 
+        service.uuid.toLowerCase() === DEVICE_CONFIG.serviceUUID.toLowerCase()
+      );
+
+      if (!gestureService) {
+        throw new Error(`Gesture service ${DEVICE_CONFIG.serviceUUID} not found`);
+      }
+
+      console.log('Found gesture service:', gestureService.uuid);
+
+      // Get characteristics
+      const characteristics = await gestureService.characteristics();
+      console.log('Available characteristics:', characteristics.map(c => c.uuid));
+
+      const dataChar = characteristics.find(char => 
+        char.uuid.toLowerCase() === DEVICE_CONFIG.dataCharacteristicUUID.toLowerCase()
+      );
+      
+      const commandChar = characteristics.find(char => 
+        char.uuid.toLowerCase() === DEVICE_CONFIG.commandCharacteristicUUID.toLowerCase()
+      );
+
+      if (!dataChar) {
+        throw new Error(`Data characteristic ${DEVICE_CONFIG.dataCharacteristicUUID} not found`);
+      }
+
+      if (!commandChar) {
+        throw new Error(`Command characteristic ${DEVICE_CONFIG.commandCharacteristicUUID} not found`);
+      }
+
+      console.log('Found data characteristic:', dataChar.uuid);
+      console.log('Found command characteristic:', commandChar.uuid);
+
+      setDataCharacteristic(dataChar);
+      setCommandCharacteristic(commandChar);
+
+      // Subscribe to data characteristic notifications
+      console.log('Subscribing to data notifications...');
+      dataChar.monitor((error: any, characteristic: any) => {
+        if (error) {
+          console.log('Notification error:', error);
+          return;
+        }
+
+        if (characteristic?.value) {
+          handleBLEData(characteristic.value);
+        }
+      });
+
+      // Set up connection monitoring
+      connectedDevice.onDisconnected((error: any, device: any) => {
+        console.log('Device disconnected:', device?.id, error);
+        setConnectedDevice(null);
+        setDataCharacteristic(null);
+        setCommandCharacteristic(null);
+        setConnectionStatus('Disconnected');
+        
+        // Show disconnection alert
+        Alert.alert(
+          '📱 Device Disconnected',
+          'The Arduino device has been disconnected.',
+          [
+            { text: 'Reconnect', onPress: () => startDeviceScan(manager) },
+            { text: 'OK' }
+          ]
+        );
+      });
+
+      setConnectionStatus('Connected & Ready');
+      setIsConnecting(false);
+
+      // Send a test ping command
+      console.log('Sending ping command...');
+      await commandChar.writeWithResponse(Buffer.from('ping', 'utf8').toString('base64'));
+
+      // Success alert
+      Alert.alert(
+        '🎉 Connection Successful!',
+        `Connected to ${device.name}\n\n✅ Services discovered\n✅ Notifications active\n✅ Ready for gesture data`,
+        [{ text: 'Great!' }]
+      );
+
+    } catch (error) {
+      console.log('Connection error:', error);
+      setIsConnecting(false);
+      setConnectionStatus('Connection Failed');
+      
+      Alert.alert(
+        '❌ Connection Failed',
+        `Could not connect to ${device.name}\n\nError: ${error}\n\nMake sure the device is nearby and not connected to another app.`,
+        [
+          { text: 'Retry', onPress: () => connectToDevice(device) },
+          { text: 'Cancel' }
+        ]
+      );
+    }
+  };
+
+  const handleBLEData = (base64Data: string) => {
+    try {
+      // Convert base64 to buffer
+      const buffer = Buffer.from(base64Data, 'base64');
+      
+      // Parse the 20-byte BLE packet structure
+      if (buffer.length === 20) {
+        const packetType = buffer.readUInt8(0);
+        const reserved = buffer.readUInt8(1);
+        const timestamp = buffer.readUInt16LE(2);
+        const sampleId = buffer.readUInt16LE(4);
+        const accX = buffer.readInt16LE(6) / 1000.0; // Convert back from scaled integer
+        const accY = buffer.readInt16LE(8) / 1000.0;
+        const accZ = buffer.readInt16LE(10) / 1000.0;
+        const gyroX = buffer.readInt16LE(12) / 10.0; // Convert back from scaled integer
+        const gyroY = buffer.readInt16LE(14) / 10.0;
+        const gyroZ = buffer.readInt16LE(16) / 10.0;
+        const recordingHash = buffer.readUInt32LE(18);
+
+        // Log packet info (limit frequency to avoid spam)
+        if (sampleId % 50 === 0 || packetType !== 0x02) { // Log every 50th data packet or all non-data packets
+          const packetTypeNames = {
+            0x01: 'SESSION_START',
+            0x02: 'SENSOR_DATA',
+            0x03: 'SESSION_END'
+          };
+          
+          console.log(`BLE Packet [${packetTypeNames[packetType as keyof typeof packetTypeNames] || 'UNKNOWN'}]:`, {
+            type: packetType,
+            timestamp,
+            sampleId,
+            hash: `0x${recordingHash.toString(16)}`,
+            ...(packetType === 0x02 && {
+              acc: { x: accX.toFixed(3), y: accY.toFixed(3), z: accZ.toFixed(3) },
+              gyro: { x: gyroX.toFixed(1), y: gyroY.toFixed(1), z: gyroZ.toFixed(1) }
+            })
+          });
+        }
+
+        // Handle different packet types
+        switch (packetType) {
+          case 0x01: // SESSION_START
+            console.log(`🎬 Gesture session started (Hash: 0x${recordingHash.toString(16)})`);
+            break;
+          case 0x02: // SENSOR_DATA
+            // Real-time sensor data - could be processed here
+            break;
+          case 0x03: // SESSION_END
+            console.log(`🎬 Gesture session ended (Duration: ${timestamp}ms, Samples: ${sampleId + 1})`);
+            break;
+        }
+      } else {
+        console.log('Received BLE data with unexpected length:', buffer.length);
+      }
+    } catch (error) {
+      console.log('Error parsing BLE data:', error);
     }
   };
 
@@ -119,17 +309,8 @@ export default function TabOneScreen() {
           bleManager.stopDeviceScan();
           setIsScanning(false);
 
-          // Show alert with device information
-          Alert.alert(
-            '🎯 Arduino Device Found!',
-            `Device: ${device.name}\nMAC Address: ${device.id}\nRSSI: ${device.rssi} dBm`,
-            [
-              {
-                text: 'Great!',
-                onPress: () => console.log('User acknowledged device found')
-              }
-            ]
-          );
+          // Automatically connect to the device
+          connectToDevice(device);
         }
       });
 
@@ -159,18 +340,40 @@ export default function TabOneScreen() {
     }
   };
 
+  const disconnectDevice = async () => {
+    if (connectedDevice) {
+      try {
+        await connectedDevice.cancelConnection();
+        console.log('Device disconnected successfully');
+      } catch (error) {
+        console.log('Error disconnecting:', error);
+      }
+    }
+  };
+
   const getStatusColor = () => {
     if (bleSupported === false) return '#FF5722'; // Red
-    if (foundDevice) return '#4CAF50'; // Green
+    if (connectedDevice) return '#4CAF50'; // Green
+    if (isConnecting) return '#FF9800'; // Orange
+    if (foundDevice) return '#2196F3'; // Blue
     if (isScanning) return '#2196F3'; // Blue
     return '#FF9800'; // Orange
   };
 
   const getStatusIcon = () => {
     if (bleSupported === false) return '⚠️';
-    if (foundDevice) return '✅';
+    if (connectedDevice) return '✅';
+    if (isConnecting) return '🔄';
+    if (foundDevice) return '📱';
     if (isScanning) return '🔍';
     return '📱';
+  };
+
+  const getCurrentStatus = () => {
+    if (connectedDevice) return connectionStatus;
+    if (isConnecting) return 'Connecting to device...';
+    if (foundDevice) return `Found ${foundDevice.name}!`;
+    return scanStatus;
   };
 
   const buildDevelopmentBuild = () => {
@@ -195,7 +398,7 @@ export default function TabOneScreen() {
       
       <View style={[styles.statusContainer, { backgroundColor: getStatusColor() }]}>
         <Text style={styles.statusIcon}>{getStatusIcon()}</Text>
-        <Text style={styles.statusText}>{scanStatus}</Text>
+        <Text style={styles.statusText}>{getCurrentStatus()}</Text>
       </View>
 
       {bleSupported === false && (
@@ -213,7 +416,7 @@ export default function TabOneScreen() {
         </View>
       )}
 
-      {!isScanning && !foundDevice && bleSupported && (
+      {!isScanning && !foundDevice && !connectedDevice && bleSupported && (
         <View style={styles.retryContainer}>
           <Text 
             style={styles.retryButton} 
@@ -224,12 +427,19 @@ export default function TabOneScreen() {
         </View>
       )}
 
-      {foundDevice && (
+      {connectedDevice && (
         <View style={styles.deviceInfo}>
           <Text style={styles.deviceTitle}>Connected Device:</Text>
-          <Text style={styles.deviceText}>Name: {foundDevice.name}</Text>
-          <Text style={styles.deviceText}>MAC: {foundDevice.id}</Text>
-          <Text style={styles.deviceText}>Signal: {foundDevice.rssi} dBm</Text>
+          <Text style={styles.deviceText}>Name: {connectedDevice.name}</Text>
+          <Text style={styles.deviceText}>MAC: {connectedDevice.id}</Text>
+          <Text style={styles.deviceText}>Status: {connectionStatus}</Text>
+          
+          <Text 
+            style={styles.disconnectButton} 
+            onPress={disconnectDevice}
+          >
+            🔌 Disconnect
+          </Text>
         </View>
       )}
 
@@ -237,9 +447,13 @@ export default function TabOneScreen() {
         <Text style={styles.instructionText}>
           {bleSupported === false 
             ? '🔧 Create development build to use Bluetooth'
-            : foundDevice 
-              ? '🎉 Your Arduino is ready for gestures!' 
-              : '⚡ Power on your Arduino device to connect'
+            : connectedDevice 
+              ? '🎉 Ready to receive gesture data! Double-tap your Arduino to start recording.' 
+              : isConnecting
+                ? '⏳ Connecting to your Arduino device...'
+                : foundDevice
+                  ? '📱 Device found, connecting automatically...'
+                  : '⚡ Power on your Arduino device to connect'
           }
         </Text>
       </View>
@@ -247,7 +461,7 @@ export default function TabOneScreen() {
       <View style={styles.configInfo}>
         <Text style={styles.configTitle}>Looking for:</Text>
         <Text style={styles.configText}>Device: {DEVICE_CONFIG.name}</Text>
-        <Text style={styles.configText}>MAC: d9:1e:41:f7:f1:c6</Text>
+        <Text style={styles.configText}>Service: {DEVICE_CONFIG.serviceUUID}</Text>
       </View>
     </View>
   );
@@ -342,6 +556,16 @@ const styles = StyleSheet.create({
     fontSize: 14,
     marginBottom: 5,
     fontFamily: 'monospace',
+  },
+  disconnectButton: {
+    fontSize: 14,
+    color: '#FF5722',
+    textAlign: 'center',
+    padding: 8,
+    backgroundColor: '#2a1a1a',
+    borderRadius: 6,
+    marginTop: 10,
+    fontWeight: '600',
   },
   instructions: {
     marginTop: 20,
