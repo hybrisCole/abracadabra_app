@@ -5,9 +5,9 @@ import { Text, View } from '@/components/Themed';
 // Arduino device configuration
 const DEVICE_CONFIG = {
   name: "AbracadabraIMU",
-  serviceUUID: "12345678-1234-1234-1234-123456789abc",
-  dataCharacteristicUUID: "87654321-4321-4321-4321-cba987654321",
-  commandCharacteristicUUID: "11223344-5566-7788-9900-aabbccddeeff"
+  serviceUUID: "8cfc8e26-0682-4f72-b0c0-c0c8e0b12a06",
+  dataCharacteristicUUID: "780fe2ec-c87c-443e-bf01-78918d9d625b",
+  commandCharacteristicUUID: "aa7e97b4-d7dc-4cb0-9fef-85875036520e"
 };
 
 export default function TabOneScreen() {
