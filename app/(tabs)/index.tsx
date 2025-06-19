@@ -1,6 +1,7 @@
-import React, { useEffect, useState } from 'react';
-import { StyleSheet, Alert, Platform, ScrollView } from 'react-native';
+import React, { useEffect, useState, useRef } from 'react';
+import { StyleSheet, Alert, Platform, ScrollView, Pressable, PermissionsAndroid } from 'react-native';
 import { Text, View } from '@/components/Themed';
+import { BleManager } from 'react-native-ble-plx';
 
 // Arduino device configuration
 const DEVICE_CONFIG = {
@@ -10,27 +11,21 @@ const DEVICE_CONFIG = {
   commandCharacteristicUUID: "aa7e97b4-d7dc-4cb0-9fef-85875036520e"
 };
 
-// Types for sensor data
-interface SensorData {
-  timestamp: number;
-  sampleId: number;
-  accX: number;
-  accY: number;
-  accZ: number;
-  gyroX: number;
-  gyroY: number;
-  gyroZ: number;
-  recordingHash: string;
-}
-
-interface SessionData {
-  sessionHash: string;
+interface GestureSession {
+  id: string;
   startTime: number;
   endTime?: number;
-  duration?: number;
-  sampleCount: number;
-  samples: SensorData[];
   isActive: boolean;
+  deviceId: string;
+  samplesReceived: number;
+}
+
+interface BLEDataPoint {
+  timestamp: number;
+  sampleId: number;
+  acceleration: { x: number; y: number; z: number };
+  gyroscope: { x: number; y: number; z: number };
+  recordingHash: string;
 }
 
 export default function TabOneScreen() {
@@ -40,72 +35,177 @@ export default function TabOneScreen() {
   const [connectedDevice, setConnectedDevice] = useState<any>(null);
   const [isConnecting, setIsConnecting] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState('Disconnected');
+  const [connectionQuality, setConnectionQuality] = useState<'Excellent' | 'Good' | 'Poor' | 'Unknown'>('Unknown');
   const [scanStatus, setScanStatus] = useState('Initializing Bluetooth...');
-  const [manager, setManager] = useState<any>(null);
+  const [manager, setManager] = useState<BleManager | null>(null);
   const [dataCharacteristic, setDataCharacteristic] = useState<any>(null);
   const [commandCharacteristic, setCommandCharacteristic] = useState<any>(null);
 
-  // Data reception state
-  const [currentSession, setCurrentSession] = useState<SessionData | null>(null);
-  const [latestSensorData, setLatestSensorData] = useState<SensorData | null>(null);
-  const [sessionHistory, setSessionHistory] = useState<SessionData[]>([]);
+  // Data storage in React state
+  const [currentSession, setCurrentSession] = useState<GestureSession | null>(null);
+  const [sessionData, setSessionData] = useState<BLEDataPoint[]>([]);
+  const [latestDataPoint, setLatestDataPoint] = useState<BLEDataPoint | null>(null);
+  const [sessionHistory, setSessionHistory] = useState<GestureSession[]>([]);
   const [totalPacketsReceived, setTotalPacketsReceived] = useState(0);
   const [dataRate, setDataRate] = useState(0); // packets per second
   const [lastDataTime, setLastDataTime] = useState<number>(0);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingProgress, setRecordingProgress] = useState(0);
 
-  // Data rate calculation
+  // New debug states
+  const [permissionsGranted, setPermissionsGranted] = useState(false);
+  const [scannedDevices, setScannedDevices] = useState<any[]>([]);
+  const [debugMode, setDebugMode] = useState(true); // Enable debug mode by default
+
+  // Request necessary permissions for BLE
+  const requestPermissions = async () => {
+    if (Platform.OS === 'android') {
+      try {
+        const granted = await PermissionsAndroid.requestMultiple([
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+        ]);
+
+        const allGranted = Object.values(granted).every(
+          permission => permission === PermissionsAndroid.RESULTS.GRANTED
+        );
+
+        setPermissionsGranted(allGranted);
+        
+        if (!allGranted) {
+          Alert.alert(
+            'Permissions Required',
+            'This app needs Bluetooth and Location permissions to work properly.',
+            [{ text: 'OK' }]
+          );
+          return false;
+        }
+        return true;
+      } catch (err) {
+        console.warn('Permission request error:', err);
+        return false;
+      }
+    } else {
+      // iOS permissions are handled through Info.plist
+      setPermissionsGranted(true);
+      return true;
+    }
+  };
+
+  // Real-time connection monitoring
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (connectedDevice) {
+        // Monitor connection quality based on data flow
+        const now = Date.now();
+        const timeSinceLastData = now - lastDataTime;
+        
+        if (timeSinceLastData < 1000) {
+          setConnectionQuality('Excellent');
+        } else if (timeSinceLastData < 3000) {
+          setConnectionQuality('Good');
+        } else if (timeSinceLastData < 10000) {
+          setConnectionQuality('Poor');
+        } else {
+          setConnectionQuality('Unknown');
+        }
+      }
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [connectedDevice, lastDataTime]);
+
+  // Data rate calculation and recording progress
   useEffect(() => {
     const interval = setInterval(() => {
       const now = Date.now();
       if (lastDataTime > 0 && now - lastDataTime < 2000) {
         // Calculate packets per second based on recent activity
-        const timeDiff = (now - lastDataTime) / 1000;
-        if (currentSession && currentSession.samples.length > 0) {
-          setDataRate(Math.round(currentSession.samples.length / ((now - currentSession.startTime) / 1000)));
+        if (currentSession && sessionData.length > 0) {
+          const sessionDuration = (now - currentSession.startTime) / 1000;
+          setDataRate(Math.round(sessionData.length / sessionDuration));
         }
       } else {
         setDataRate(0);
       }
-    }, 1000);
+
+      // Update recording progress for active sessions
+      if (currentSession?.isActive) {
+        const elapsed = now - currentSession.startTime;
+        const estimatedDuration = 4000; // 4 seconds typical recording
+        const progress = Math.min((elapsed / estimatedDuration) * 100, 100);
+        setRecordingProgress(progress);
+      } else {
+        setRecordingProgress(0);
+      }
+    }, 100); // Update more frequently for smooth progress
 
     return () => clearInterval(interval);
-  }, [lastDataTime, currentSession]);
+  }, [lastDataTime, currentSession, sessionData]);
 
   useEffect(() => {
+    const initializeBLE = async () => {
+      console.log('🚀 Starting BLE initialization...');
+      setScanStatus('Requesting permissions...');
+      
+      // First, request permissions
+      const permissionsOk = await requestPermissions();
+      if (!permissionsOk) {
+        setScanStatus('Permissions denied - cannot scan for devices');
+        return;
+      }
+
+      try {
+        console.log('🔵 Creating BLE Manager...');
+        const bleManager = new BleManager();
+        setManager(bleManager);
+        
+        // Check BLE support
+        bleManager.onStateChange((state) => {
+          console.log('🔵 BLE State changed to:', state);
+          if (state === 'PoweredOn') {
+            setBleSupported(true);
+            setScanStatus('Bluetooth ready');
+            // Start scanning after a short delay
+            setTimeout(() => {
+              startDeviceScan(bleManager);
+            }, 1000);
+          } else {
+            setBleSupported(false);
+            setScanStatus(`Bluetooth state: ${state}`);
+          }
+        }, true);
+        
+      } catch (error) {
+        console.log('❌ BLE initialization error:', error);
+        setScanStatus('BLE initialization failed');
+      }
+    };
+
     initializeBLE();
+
+    // Cleanup on unmount
+    return () => {
+      if (manager) {
+        manager.stopDeviceScan();
+        if (connectedDevice) {
+          connectedDevice.cancelConnection();
+        }
+      }
+    };
   }, []);
 
-  const initializeBLE = async () => {
-    try {
-      // Dynamic import to avoid initialization error in Expo Go
-      const { BleManager } = await import('react-native-ble-plx');
-      const bleManager = new BleManager();
-      setManager(bleManager);
-      setBleSupported(true);
-      setScanStatus('Bluetooth initialized, checking state...');
-      
-      // Wait a bit for BLE to fully initialize
-      setTimeout(() => {
-        startDeviceScan(bleManager);
-      }, 1000);
-      
-    } catch (error) {
-      console.log('BLE not supported in this environment:', error);
-      setBleSupported(false);
-      setScanStatus('BLE requires development build');
-    }
-  };
-
-  const checkBluetoothState = async (bleManager: any, retryCount = 0) => {
+  const checkBluetoothState = async (bleManager: BleManager, retryCount = 0) => {
     try {
       const state = await bleManager.state();
-      console.log('Bluetooth state:', state);
+      console.log('🔵 Bluetooth state:', state);
       
       if (state === 'PoweredOn') {
         return true;
       } else if (state === 'Unknown' && retryCount < 3) {
         // Bluetooth state might still be initializing, retry
-        console.log('Bluetooth state unknown, retrying...', retryCount + 1);
+        console.log('🔵 Bluetooth state unknown, retrying...', retryCount + 1);
         await new Promise(resolve => setTimeout(resolve, 1000));
         return checkBluetoothState(bleManager, retryCount + 1);
       } else {
@@ -113,7 +213,7 @@ export default function TabOneScreen() {
         return false;
       }
     } catch (error) {
-      console.log('Error checking Bluetooth state:', error);
+      console.log('❌ Error checking Bluetooth state:', error);
       if (retryCount < 2) {
         await new Promise(resolve => setTimeout(resolve, 1000));
         return checkBluetoothState(bleManager, retryCount + 1);
@@ -122,27 +222,106 @@ export default function TabOneScreen() {
     }
   };
 
-  const connectToDevice = async (device: any) => {
-    if (!manager || !device) {
-      console.log('Manager or device not available for connection');
+  // Gesture analysis function
+  const analyzeGesture = (sessionData: BLEDataPoint[]) => {
+    if (sessionData.length === 0) return null;
+
+    // Calculate basic statistics
+    const totalSamples = sessionData.length;
+    const duration = sessionData[sessionData.length - 1]?.timestamp - sessionData[0]?.timestamp;
+    
+    // Calculate acceleration magnitudes
+    const accMagnitudes = sessionData.map(point => {
+      const { acceleration } = point;
+      return Math.sqrt(acceleration.x * acceleration.x + acceleration.y * acceleration.y + acceleration.z * acceleration.z);
+    });
+    
+    // Calculate gyroscope magnitudes
+    const gyroMagnitudes = sessionData.map(point => {
+      const { gyroscope } = point;
+      return Math.sqrt(gyroscope.x * gyroscope.x + gyroscope.y * gyroscope.y + gyroscope.z * gyroscope.z);
+    });
+    
+    // Basic statistics
+    const avgAccelMagnitude = accMagnitudes.reduce((a, b) => a + b, 0) / accMagnitudes.length;
+    const avgGyroMagnitude = gyroMagnitudes.reduce((a, b) => a + b, 0) / gyroMagnitudes.length;
+    const maxAccelMagnitude = Math.max(...accMagnitudes);
+    const maxGyroMagnitude = Math.max(...gyroMagnitudes);
+    
+    return {
+      totalSamples,
+      duration,
+      avgAccelMagnitude: avgAccelMagnitude.toFixed(3),
+      maxAccelMagnitude: maxAccelMagnitude.toFixed(3),
+      avgGyroMagnitude: avgGyroMagnitude.toFixed(1),
+      maxGyroMagnitude: maxGyroMagnitude.toFixed(1),
+      samplingRate: ((totalSamples / (duration / 1000)) || 0).toFixed(1)
+    };
+  };
+
+  const connectToDevice = async (device: any, bleManager?: BleManager) => {
+    // Use passed manager or fallback to state manager
+    const currentManager = bleManager || manager;
+    
+    console.log('connectToDevice called with:', {
+      deviceAvailable: !!device,
+      managerAvailable: !!currentManager,
+      passedManagerAvailable: !!bleManager,
+      stateManagerAvailable: !!manager,
+      deviceId: device?.id,
+      deviceName: device?.name
+    });
+
+    if (!currentManager) {
+      console.error('BLE Manager not available for connection');
+      Alert.alert('Connection Error', 'Bluetooth manager not initialized. Please restart the app.');
+      return;
+    }
+
+    if (!device) {
+      console.error('Device not available for connection');
+      Alert.alert('Connection Error', 'Device information not available. Please retry scanning.');
       return;
     }
 
     try {
       setIsConnecting(true);
-      setConnectionStatus('Connecting...');
+      setConnectionStatus('Connecting to device...');
       console.log('Attempting to connect to device:', device.id);
 
-      // Connect to the device
-      const connectedDevice = await device.connectWithTimeout(10000); // 10 second timeout
-      console.log('Connected to device:', connectedDevice.id);
+      // Connect to the device through the manager with timeout
+      console.log('Calling manager.connectToDevice...');
+      
+      // Create a timeout promise to prevent hanging
+      const connectTimeout = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Connection timeout after 15 seconds')), 15000);
+      });
+      
+      // Race between connection and timeout
+      const connectedDevice = await Promise.race([
+        currentManager.connectToDevice(device.id),
+        connectTimeout
+      ]);
+      
+      console.log('Successfully connected to device:', connectedDevice.id);
+      console.log('Device connection state:', connectedDevice.isConnected);
       
       setConnectedDevice(connectedDevice);
       setConnectionStatus('Connected - Discovering services...');
 
-      // Discover all services and characteristics
+      // Discover all services and characteristics with timeout
       console.log('Discovering services and characteristics...');
-      await connectedDevice.discoverAllServicesAndCharacteristics();
+      
+      const discoveryTimeout = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Service discovery timeout after 10 seconds')), 10000);
+      });
+      
+      await Promise.race([
+        connectedDevice.discoverAllServicesAndCharacteristics(),
+        discoveryTimeout
+      ]);
+      
+      console.log('Service discovery completed');
       
       setConnectionStatus('Connected - Setting up notifications...');
 
@@ -188,7 +367,7 @@ export default function TabOneScreen() {
 
       // Subscribe to data characteristic notifications
       console.log('Subscribing to data notifications...');
-      dataChar.monitor((error: any, characteristic: any) => {
+      const subscription = dataChar.monitor((error: any, characteristic: any) => {
         if (error) {
           console.log('Notification error:', error);
           return;
@@ -199,6 +378,8 @@ export default function TabOneScreen() {
         }
       });
 
+      console.log('Data notifications subscribed successfully');
+
       // Set up connection monitoring
       connectedDevice.onDisconnected((error: any, device: any) => {
         console.log('Device disconnected:', device?.id, error);
@@ -206,6 +387,8 @@ export default function TabOneScreen() {
         setDataCharacteristic(null);
         setCommandCharacteristic(null);
         setConnectionStatus('Disconnected');
+        setConnectionQuality('Unknown');
+        setIsRecording(false);
         
         // Clear current session on disconnect
         if (currentSession?.isActive) {
@@ -217,18 +400,26 @@ export default function TabOneScreen() {
           '📱 Device Disconnected',
           'The Arduino device has been disconnected.',
           [
-            { text: 'Reconnect', onPress: () => startDeviceScan(manager) },
+            { text: 'Reconnect', onPress: () => startDeviceScan() },
             { text: 'OK' }
           ]
         );
       });
 
       setConnectionStatus('Connected & Ready');
+      setConnectionQuality('Excellent');
       setIsConnecting(false);
 
       // Send a test ping command
       console.log('Sending ping command...');
-      await commandChar.writeWithResponse(Buffer.from('ping', 'utf8').toString('base64'));
+      try {
+        // Convert string to base64 for React Native
+        const pingData = btoa('ping'); // btoa is available in React Native
+        await commandChar.writeWithResponse(pingData);
+        console.log('Ping command sent successfully');
+      } catch (pingError) {
+        console.log('Ping command failed (non-critical):', pingError);
+      }
 
       // Success alert
       Alert.alert(
@@ -238,145 +429,148 @@ export default function TabOneScreen() {
       );
 
     } catch (error) {
-      console.log('Connection error:', error);
+      console.error('Connection error:', error);
       setIsConnecting(false);
       setConnectionStatus('Connection Failed');
+      setConnectionQuality('Unknown');
+      
+      // Determine error type and provide specific guidance
+      let errorMessage = 'Unknown connection error';
+      let troubleshooting = '';
+      
+      if (error.message?.includes('timeout')) {
+        errorMessage = 'Connection timed out';
+        troubleshooting = '\n• Move closer to the device\n• Make sure the device is powered on\n• Check if another app is connected to the device';
+      } else if (error.message?.includes('Service discovery')) {
+        errorMessage = 'Could not discover device services';
+        troubleshooting = '\n• The device may not be running the correct firmware\n• Try restarting the Arduino device';
+      } else if (error.message?.includes('characteristic')) {
+        errorMessage = 'Device services incompatible';
+        troubleshooting = '\n• Make sure the Arduino is running the latest firmware\n• Check that the device is an AbracadabraIMU device';
+      } else {
+        errorMessage = error.message || 'Connection failed';
+        troubleshooting = '\n• Make sure Bluetooth is enabled\n• Try restarting the app\n• Move closer to the device';
+      }
       
       Alert.alert(
         '❌ Connection Failed',
-        `Could not connect to ${device.name}\n\nError: ${error}\n\nMake sure the device is nearby and not connected to another app.`,
+        `${errorMessage}\n\nTroubleshooting:${troubleshooting}`,
         [
-          { text: 'Retry', onPress: () => connectToDevice(device) },
+          { text: 'Retry', onPress: () => connectToDevice(device, currentManager) },
+          { text: 'Rescan', onPress: () => startDeviceScan() },
           { text: 'Cancel' }
         ]
       );
     }
   };
 
+  // Handle BLE data packets from Arduino
   const handleBLEData = (base64Data: string) => {
     try {
-      // Convert base64 to buffer
-      const buffer = Buffer.from(base64Data, 'base64');
-      
-      // Parse the 20-byte BLE packet structure
-      if (buffer.length === 20) {
-        const packetType = buffer.readUInt8(0);
-        const reserved = buffer.readUInt8(1);
-        const timestamp = buffer.readUInt16LE(2);
-        const sampleId = buffer.readUInt16LE(4);
-        const accX = buffer.readInt16LE(6) / 1000.0; // Convert back from scaled integer
-        const accY = buffer.readInt16LE(8) / 1000.0;
-        const accZ = buffer.readInt16LE(10) / 1000.0;
-        const gyroX = buffer.readInt16LE(12) / 10.0; // Convert back from scaled integer
-        const gyroY = buffer.readInt16LE(14) / 10.0;
-        const gyroZ = buffer.readInt16LE(16) / 10.0;
-        const recordingHash = buffer.readUInt32LE(18);
-
-        const hashString = `0x${recordingHash.toString(16)}`;
-        const now = Date.now();
-
-        // Update total packets received
-        setTotalPacketsReceived(prev => prev + 1);
-        setLastDataTime(now);
-
-        // Handle different packet types
-        switch (packetType) {
-          case 0x01: // SESSION_START
-            console.log(`🎬 Gesture session started (Hash: ${hashString})`);
-            
-            // Create new session
-            const newSession: SessionData = {
-              sessionHash: hashString,
-              startTime: now,
-              sampleCount: 0,
-              samples: [],
-              isActive: true
-            };
-            
-            setCurrentSession(newSession);
-            break;
-
-          case 0x02: // SENSOR_DATA
-            // Create sensor data object
-            const sensorData: SensorData = {
-              timestamp,
-              sampleId,
-              accX,
-              accY,
-              accZ,
-              gyroX,
-              gyroY,
-              gyroZ,
-              recordingHash: hashString
-            };
-
-            // Update latest sensor data for real-time display
-            setLatestSensorData(sensorData);
-
-            // Add to current session if active
-            if (currentSession?.isActive && currentSession.sessionHash === hashString) {
-              setCurrentSession(prev => {
-                if (!prev) return null;
-                return {
-                  ...prev,
-                  sampleCount: prev.sampleCount + 1,
-                  samples: [...prev.samples, sensorData]
-                };
-              });
-            }
-            break;
-
-          case 0x03: // SESSION_END
-            console.log(`🎬 Gesture session ended (Duration: ${timestamp}ms, Samples: ${sampleId + 1})`);
-            
-            // Finalize current session
-            if (currentSession?.isActive && currentSession.sessionHash === hashString) {
-              const finalizedSession: SessionData = {
-                ...currentSession,
-                endTime: now,
-                duration: timestamp,
-                sampleCount: sampleId + 1,
-                isActive: false
-              };
-
-              setCurrentSession(finalizedSession);
-              
-              // Add to session history
-              setSessionHistory(prev => [finalizedSession, ...prev.slice(0, 9)]); // Keep last 10 sessions
-              
-              console.log(`📊 Session completed: ${finalizedSession.samples.length} samples collected`);
-            }
-            break;
-        }
-
-        // Log packet info occasionally to avoid spam
-        if (sampleId % 100 === 0 || packetType !== 0x02) {
-          const packetTypeNames = {
-            0x01: 'SESSION_START',
-            0x02: 'SENSOR_DATA',
-            0x03: 'SESSION_END'
-          };
-          
-          console.log(`BLE Packet [${packetTypeNames[packetType as keyof typeof packetTypeNames] || 'UNKNOWN'}]:`, {
-            type: packetType,
-            timestamp,
-            sampleId,
-            hash: hashString,
-            ...(packetType === 0x02 && {
-              acc: { x: accX.toFixed(3), y: accY.toFixed(3), z: accZ.toFixed(3) },
-              gyro: { x: gyroX.toFixed(1), y: gyroY.toFixed(1), z: gyroZ.toFixed(1) }
-            })
-          });
-        }
-      } else {
-        console.log('Received BLE data with unexpected length:', buffer.length);
+      // Decode base64 to binary data
+      const binaryString = atob(base64Data);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
       }
+
+      // Check if we have the expected packet size (20 bytes)
+      if (bytes.length !== 20) {
+        console.log('Unexpected packet size:', bytes.length);
+        return;
+      }
+
+      // Parse the BLE packet according to Arduino's BLEPacket structure
+      const dataView = new DataView(bytes.buffer);
+      
+      const packetType = dataView.getUint8(0);
+      const reserved = dataView.getUint8(1);
+      const timestamp = dataView.getUint16(2, true); // little endian
+      const sampleId = dataView.getUint16(4, true);
+      const accX = dataView.getInt16(6, true) / 1000.0; // Convert back from scaled int
+      const accY = dataView.getInt16(8, true) / 1000.0;
+      const accZ = dataView.getInt16(10, true) / 1000.0;
+      const gyroX = dataView.getInt16(12, true) / 10.0; // Convert back from scaled int
+      const gyroY = dataView.getInt16(14, true) / 10.0;
+      const gyroZ = dataView.getInt16(16, true) / 10.0;
+      const recordingHash = dataView.getUint32(16, true); // Note: overlaps with gyroZ
+
+      // Handle different packet types
+      if (packetType === 0x01) {
+        // SESSION_START packet
+        console.log('🎬 Session start detected, Hash:', recordingHash.toString(16));
+        
+        const newSession: GestureSession = {
+          id: recordingHash.toString(16),
+          startTime: Date.now(),
+          isActive: true,
+          deviceId: connectedDevice?.id || 'unknown',
+          samplesReceived: 0
+        };
+        
+        setCurrentSession(newSession);
+        setSessionData([]);
+        setIsRecording(true);
+        
+      } else if (packetType === 0x02) {
+        // SENSOR_DATA packet
+        const dataPoint: BLEDataPoint = {
+          timestamp,
+          sampleId,
+          acceleration: { x: accX, y: accY, z: accZ },
+          gyroscope: { x: gyroX, y: gyroY, z: gyroZ },
+          recordingHash: recordingHash.toString(16)
+        };
+        
+        setLatestDataPoint(dataPoint);
+        setSessionData(prev => [...prev, dataPoint]);
+        
+        // Update session sample count
+        if (currentSession?.isActive) {
+          setCurrentSession(prev => prev ? { 
+            ...prev, 
+            samplesReceived: prev.samplesReceived + 1 
+          } : null);
+        }
+        
+        // Log occasionally to avoid spam
+        if (sampleId % 50 === 0) {
+          console.log(`Sample ${sampleId}: Acc=[${accX.toFixed(2)}, ${accY.toFixed(2)}, ${accZ.toFixed(2)}] Gyro=[${gyroX.toFixed(1)}, ${gyroY.toFixed(1)}, ${gyroZ.toFixed(1)}]`);
+        }
+        
+      } else if (packetType === 0x03) {
+        // SESSION_END packet
+        console.log('🏁 Session end detected, Duration:', timestamp, 'ms, Total samples:', sampleId + 1);
+        
+        if (currentSession?.isActive) {
+          setCurrentSession(prev => prev ? { 
+            ...prev, 
+            endTime: Date.now(),
+            isActive: false 
+          } : null);
+        }
+        
+        setIsRecording(false);
+        
+        // Analyze the session data
+        const analysis = analyzeGesture(sessionData);
+        
+        // Show session summary
+        Alert.alert(
+          '📊 Gesture Recording Complete!',
+          `✅ Duration: ${timestamp}ms\n✅ Samples: ${sampleId + 1}\n✅ Avg Acceleration: ${analysis?.avgAccelMagnitude || 'N/A'}g\n✅ Sampling Rate: ${analysis?.samplingRate || 'N/A'}Hz`,
+          [{ text: 'Great!' }]
+        );
+      }
+      
     } catch (error) {
       console.log('Error parsing BLE data:', error);
     }
   };
 
-  const startDeviceScan = async (bleManager: any) => {
+  const startDeviceScan = async (existingManager?: BleManager) => {
+    const bleManager = existingManager || manager;
+    
     if (!bleManager) {
       setScanStatus('BLE not initialized');
       return;
@@ -384,6 +578,7 @@ export default function TabOneScreen() {
 
     try {
       setIsScanning(true);
+      setScannedDevices([]); // Clear previous scan results
       setScanStatus('Checking Bluetooth state...');
 
       // Check if Bluetooth is powered on with retry logic
@@ -393,7 +588,7 @@ export default function TabOneScreen() {
         setScanStatus('Bluetooth is not powered on');
         Alert.alert(
           'Bluetooth Required',
-          'Please make sure Bluetooth is enabled in iOS Settings.',
+          'Please make sure Bluetooth is enabled in Settings.',
           [
             { text: 'Retry', onPress: () => startDeviceScan(bleManager) },
             { text: 'Cancel' }
@@ -404,58 +599,120 @@ export default function TabOneScreen() {
       }
 
       setScanStatus('Scanning for Arduino device...');
-      console.log('Starting BLE scan for', DEVICE_CONFIG.name);
+      console.log('🔍 Starting BLE scan for:', DEVICE_CONFIG.name);
+      console.log('🔍 Service UUID:', DEVICE_CONFIG.serviceUUID);
 
-      // Start scanning for devices
-      bleManager.startDeviceScan(null, null, (error: any, device: any) => {
+      let scanTimeout: NodeJS.Timeout;
+
+      // Start scanning for devices (scan for all devices, not just specific service)
+      bleManager.startDeviceScan(null, { allowDuplicates: false }, (error: any, device: any) => {
         if (error) {
-          console.log('Scan error:', error);
+          console.log('❌ Scan error:', error);
           setScanStatus(`Scan error: ${error.message}`);
           setIsScanning(false);
           return;
         }
 
-        console.log('Found device:', device?.name, device?.id);
+        if (device) {
+          console.log('📱 Found device:', {
+            name: device.name || 'Unknown',
+            id: device.id,
+            rssi: device.rssi,
+            serviceUUIDs: device.serviceUUIDs
+          });
 
-        if (device && device.name === DEVICE_CONFIG.name) {
-          // Found our Arduino device!
-          console.log('Found Arduino device:', device);
-          setFoundDevice(device);
-          setScanStatus(`Found ${device.name}!`);
-          
-          // Stop scanning
-          bleManager.stopDeviceScan();
-          setIsScanning(false);
+          // Add to scanned devices for debugging
+          setScannedDevices(prev => {
+            const exists = prev.find(d => d.id === device.id);
+            if (!exists) {
+              return [...prev, {
+                name: device.name || 'Unknown',
+                id: device.id,
+                rssi: device.rssi,
+                serviceUUIDs: device.serviceUUIDs
+              }];
+            }
+            return prev;
+          });
 
-          // Automatically connect to the device
-          connectToDevice(device);
+          // Check if this is our Arduino device by name
+          if (device.name === DEVICE_CONFIG.name) {
+            console.log('✅ Found Arduino device:', device.name);
+            setFoundDevice(device);
+            setScanStatus(`Found ${device.name}!`);
+            
+            // Stop scanning
+            bleManager.stopDeviceScan();
+            clearTimeout(scanTimeout);
+            setIsScanning(false);
+
+            // Update manager state and connect to device immediately
+            setManager(bleManager);
+            connectToDevice(device, bleManager);
+            return;
+          }
+
+          // Also check by service UUID if name doesn't match
+          if (device.serviceUUIDs && device.serviceUUIDs.includes(DEVICE_CONFIG.serviceUUID)) {
+            console.log('✅ Found device with matching service UUID:', device.name || device.id);
+            setFoundDevice(device);
+            setScanStatus(`Found device with matching service!`);
+            
+            // Stop scanning
+            bleManager.stopDeviceScan();
+            clearTimeout(scanTimeout);
+            setIsScanning(false);
+
+            setManager(bleManager);
+            connectToDevice(device, bleManager);
+            return;
+          }
         }
       });
 
-      // Stop scanning after 15 seconds if device not found
-      setTimeout(() => {
+      // Stop scanning after 20 seconds if device not found
+      scanTimeout = setTimeout(() => {
         if (isScanning) {
           bleManager.stopDeviceScan();
           setIsScanning(false);
+          
+          console.log('⏰ Scan timeout. Devices found:', scannedDevices.length);
+          scannedDevices.forEach(device => {
+            console.log(`  - ${device.name} (${device.id}) RSSI: ${device.rssi}`);
+          });
+          
           if (!foundDevice) {
-            setScanStatus('Arduino device not found. Make sure it\'s powered on.');
+            setScanStatus(`Device not found. Scanned ${scannedDevices.length} devices.`);
             Alert.alert(
               '🔍 Device Not Found',
-              'Could not find "AbracadabraIMU" device.\n\nMake sure:\n• Arduino is powered on\n• Bluetooth is enabled\n• Device is nearby',
+              `Could not find "AbracadabraIMU" device.\n\nScanned ${scannedDevices.length} devices.\n\nMake sure:\n• Arduino is powered on\n• Device is advertising\n• Device is nearby\n• Name matches exactly`,
               [
+                { text: 'Show Debug Info', onPress: () => showDebugInfo() },
                 { text: 'Retry', onPress: () => startDeviceScan(bleManager) },
                 { text: 'Cancel' }
               ]
             );
           }
         }
-      }, 15000);
+      }, 20000);
 
     } catch (error) {
-      console.log('Error starting scan:', error);
+      console.log('❌ Error starting scan:', error);
       setScanStatus(`Error: ${error}`);
       setIsScanning(false);
     }
+  };
+
+  const showDebugInfo = () => {
+    const deviceList = scannedDevices.map(device => 
+      `${device.name} (RSSI: ${device.rssi})`
+    ).join('\n');
+    
+    Alert.alert(
+      'Debug Information',
+      `Permissions: ${permissionsGranted ? '✅' : '❌'}\nBLE Supported: ${bleSupported ? '✅' : '❌'}\n\nDevices Found (${scannedDevices.length}):\n${deviceList || 'None'}\n\nLooking for: "${DEVICE_CONFIG.name}"\nService UUID: ${DEVICE_CONFIG.serviceUUID}`,
+      [{ text: 'OK' }]
+    );
   };
 
   const disconnectDevice = async () => {
@@ -469,16 +726,25 @@ export default function TabOneScreen() {
     }
   };
 
-  const clearSessionHistory = () => {
+  const clearAllData = () => {
     setSessionHistory([]);
     setTotalPacketsReceived(0);
     setCurrentSession(null);
-    setLatestSensorData(null);
+    setLatestDataPoint(null);
+    setIsRecording(false);
+    setRecordingProgress(0);
   };
 
-  const getStatusColor = () => {
+  const getConnectionStatusColor = () => {
     if (bleSupported === false) return '#FF5722'; // Red
-    if (connectedDevice) return '#4CAF50'; // Green
+    if (connectedDevice) {
+      switch (connectionQuality) {
+        case 'Excellent': return '#4CAF50'; // Green
+        case 'Good': return '#8BC34A'; // Light Green
+        case 'Poor': return '#FF9800'; // Orange
+        default: return '#2196F3'; // Blue
+      }
+    }
     if (isConnecting) return '#FF9800'; // Orange
     if (foundDevice) return '#2196F3'; // Blue
     if (isScanning) return '#2196F3'; // Blue
@@ -487,7 +753,15 @@ export default function TabOneScreen() {
 
   const getStatusIcon = () => {
     if (bleSupported === false) return '⚠️';
-    if (connectedDevice) return '✅';
+    if (connectedDevice) {
+      if (isRecording) return '🔴'; // Recording indicator
+      switch (connectionQuality) {
+        case 'Excellent': return '📶';
+        case 'Good': return '📶';
+        case 'Poor': return '📶';
+        default: return '✅';
+      }
+    }
     if (isConnecting) return '🔄';
     if (foundDevice) return '📱';
     if (isScanning) return '🔍';
@@ -495,7 +769,10 @@ export default function TabOneScreen() {
   };
 
   const getCurrentStatus = () => {
-    if (connectedDevice) return connectionStatus;
+    if (connectedDevice) {
+      if (isRecording) return `Recording... (${connectionQuality} signal)`;
+      return `${connectionStatus} (${connectionQuality})`;
+    }
     if (isConnecting) return 'Connecting to device...';
     if (foundDevice) return `Found ${foundDevice.name}!`;
     return scanStatus;
@@ -513,6 +790,41 @@ export default function TabOneScreen() {
     if (manager) {
       startDeviceScan(manager);
     } else {
+      // Re-initialize BLE from scratch
+      const initializeBLE = async () => {
+        console.log('🚀 Re-initializing BLE...');
+        setScanStatus('Re-initializing...');
+        
+        const permissionsOk = await requestPermissions();
+        if (!permissionsOk) {
+          setScanStatus('Permissions denied - cannot scan for devices');
+          return;
+        }
+
+        try {
+          const bleManager = new BleManager();
+          setManager(bleManager);
+          
+          bleManager.onStateChange((state) => {
+            console.log('🔵 BLE State changed to:', state);
+            if (state === 'PoweredOn') {
+              setBleSupported(true);
+              setScanStatus('Bluetooth ready');
+              setTimeout(() => {
+                startDeviceScan(bleManager);
+              }, 1000);
+            } else {
+              setBleSupported(false);
+              setScanStatus(`Bluetooth state: ${state}`);
+            }
+          }, true);
+          
+        } catch (error) {
+          console.log('❌ BLE re-initialization error:', error);
+          setScanStatus('BLE initialization failed');
+        }
+      };
+      
       initializeBLE();
     }
   };
@@ -521,10 +833,51 @@ export default function TabOneScreen() {
     <ScrollView style={styles.container} contentContainerStyle={styles.contentContainer}>
       <Text style={styles.title}>Abracadabra App</Text>
       
-      <View style={[styles.statusContainer, { backgroundColor: getStatusColor() }]}>
+      {/* Real-time Connection Status */}
+      <View style={[styles.statusContainer, { backgroundColor: getConnectionStatusColor() }]}>
         <Text style={styles.statusIcon}>{getStatusIcon()}</Text>
         <Text style={styles.statusText}>{getCurrentStatus()}</Text>
       </View>
+
+      {/* Debug Information */}
+      {debugMode && (
+        <View style={styles.debugContainer}>
+          <Text style={styles.debugTitle}>🔧 Debug Information</Text>
+          <Text style={styles.debugText}>Permissions: {permissionsGranted ? '✅ Granted' : '❌ Denied'}</Text>
+          <Text style={styles.debugText}>BLE Support: {bleSupported ? '✅ Enabled' : '❌ Disabled'}</Text>
+          <Text style={styles.debugText}>Devices Found: {scannedDevices.length}</Text>
+          {scannedDevices.length > 0 && (
+            <View style={styles.deviceList}>
+              <Text style={styles.debugText}>Nearby Devices:</Text>
+              {scannedDevices.slice(0, 5).map((device, index) => (
+                <Text key={index} style={styles.deviceText}>
+                  • {device.name} ({device.rssi}dBm)
+                </Text>
+              ))}
+              {scannedDevices.length > 5 && (
+                <Text style={styles.deviceText}>... and {scannedDevices.length - 5} more</Text>
+              )}
+            </View>
+          )}
+          <Pressable 
+            style={styles.debugButton} 
+            onPress={showDebugInfo}
+          >
+            <Text style={styles.debugButtonText}>Show Full Debug Info</Text>
+          </Pressable>
+        </View>
+      )}
+
+      {/* Recording Status Indicator */}
+      {isRecording && (
+        <View style={styles.recordingContainer}>
+          <Text style={styles.recordingTitle}>🔴 RECORDING IN PROGRESS</Text>
+          <View style={styles.progressBar}>
+            <View style={[styles.progressFill, { width: `${recordingProgress}%` }]} />
+          </View>
+          <Text style={styles.progressText}>{Math.round(recordingProgress)}% Complete</Text>
+        </View>
+      )}
 
       {bleSupported === false && (
         <View style={styles.errorContainer}>
@@ -557,7 +910,7 @@ export default function TabOneScreen() {
           <Text style={styles.deviceTitle}>Connected Device:</Text>
           <Text style={styles.deviceText}>Name: {connectedDevice.name}</Text>
           <Text style={styles.deviceText}>MAC: {connectedDevice.id}</Text>
-          <Text style={styles.deviceText}>Status: {connectionStatus}</Text>
+          <Text style={styles.deviceText}>Quality: {connectionQuality}</Text>
           
           <Text 
             style={styles.disconnectButton} 
@@ -568,7 +921,7 @@ export default function TabOneScreen() {
         </View>
       )}
 
-      {/* Real-time Data Display */}
+      {/* Live Sensor Data Display */}
       {connectedDevice && (
         <View style={styles.dataContainer}>
           <Text style={styles.dataTitle}>📊 Live Data Stream</Text>
@@ -576,42 +929,43 @@ export default function TabOneScreen() {
           <View style={styles.statsRow}>
             <Text style={styles.statText}>Packets: {totalPacketsReceived}</Text>
             <Text style={styles.statText}>Rate: {dataRate} Hz</Text>
+            <Text style={styles.statText}>Signal: {connectionQuality}</Text>
           </View>
 
           {currentSession?.isActive && (
             <View style={styles.sessionInfo}>
-              <Text style={styles.sessionTitle}>🎬 Recording Session</Text>
-              <Text style={styles.sessionText}>Hash: {currentSession.sessionHash}</Text>
-              <Text style={styles.sessionText}>Samples: {currentSession.sampleCount}</Text>
+              <Text style={styles.sessionTitle}>🎬 Active Session</Text>
+              <Text style={styles.sessionText}>Hash: {currentSession.id}</Text>
+              <Text style={styles.sessionText}>Samples: {currentSession.samplesReceived}</Text>
               <Text style={styles.sessionText}>Duration: {Math.round((Date.now() - currentSession.startTime) / 1000)}s</Text>
             </View>
           )}
 
-          {latestSensorData && (
+          {latestDataPoint && (
             <View style={styles.sensorData}>
               <Text style={styles.sensorTitle}>Latest Sensor Reading:</Text>
               <View style={styles.sensorRow}>
                 <Text style={styles.sensorLabel}>Accel:</Text>
                 <Text style={styles.sensorValue}>
-                  X: {latestSensorData.accX.toFixed(3)}g
+                  X: {latestDataPoint.acceleration.x.toFixed(3)}g
                 </Text>
                 <Text style={styles.sensorValue}>
-                  Y: {latestSensorData.accY.toFixed(3)}g
+                  Y: {latestDataPoint.acceleration.y.toFixed(3)}g
                 </Text>
                 <Text style={styles.sensorValue}>
-                  Z: {latestSensorData.accZ.toFixed(3)}g
+                  Z: {latestDataPoint.acceleration.z.toFixed(3)}g
                 </Text>
               </View>
               <View style={styles.sensorRow}>
                 <Text style={styles.sensorLabel}>Gyro:</Text>
                 <Text style={styles.sensorValue}>
-                  X: {latestSensorData.gyroX.toFixed(1)}°/s
+                  X: {latestDataPoint.gyroscope.x.toFixed(1)}°/s
                 </Text>
                 <Text style={styles.sensorValue}>
-                  Y: {latestSensorData.gyroY.toFixed(1)}°/s
+                  Y: {latestDataPoint.gyroscope.y.toFixed(1)}°/s
                 </Text>
                 <Text style={styles.sensorValue}>
-                  Z: {latestSensorData.gyroZ.toFixed(1)}°/s
+                  Z: {latestDataPoint.gyroscope.z.toFixed(1)}°/s
                 </Text>
               </View>
             </View>
@@ -622,32 +976,35 @@ export default function TabOneScreen() {
       {/* Session History */}
       {sessionHistory.length > 0 && (
         <View style={styles.historyContainer}>
-          <View style={styles.historyHeader}>
-            <Text style={styles.historyTitle}>📝 Session History</Text>
-            <Text style={styles.clearButton} onPress={clearSessionHistory}>
-              🗑️ Clear
-            </Text>
-          </View>
+          <Text style={styles.historyTitle}>📚 Recent Sessions</Text>
           
           {sessionHistory.slice(0, 3).map((session, index) => (
-            <View key={session.sessionHash} style={styles.historyItem}>
+            <View key={session.id} style={styles.historyItem}>
               <Text style={styles.historyText}>
-                Session {index + 1}: {session.sampleCount} samples
+                Session {index + 1}: {session.samplesReceived} samples
               </Text>
               <Text style={styles.historySubtext}>
-                Duration: {session.duration}ms | Hash: {session.sessionHash}
+                {session.endTime ? 
+                  `Duration: ${((session.endTime - session.startTime) / 1000).toFixed(1)}s` : 
+                  'Active'
+                } | Hash: {session.id}
               </Text>
             </View>
           ))}
         </View>
       )}
 
+      {/* Clear Data Button */}
+      <Pressable style={styles.clearButton} onPress={clearAllData}>
+        <Text style={styles.clearButtonText}>🗑️ Clear All Data</Text>
+      </Pressable>
+
       <View style={styles.instructions}>
         <Text style={styles.instructionText}>
           {bleSupported === false 
             ? '🔧 Create development build to use Bluetooth'
             : connectedDevice 
-              ? currentSession?.isActive
+              ? isRecording
                 ? '🔴 Recording in progress... Perform your gesture!'
                 : '🎉 Ready to receive gesture data! Double-tap your Arduino to start recording.' 
               : isConnecting
@@ -660,9 +1017,10 @@ export default function TabOneScreen() {
       </View>
 
       <View style={styles.configInfo}>
-        <Text style={styles.configTitle}>Looking for:</Text>
+        <Text style={styles.configTitle}>Configuration:</Text>
         <Text style={styles.configText}>Device: {DEVICE_CONFIG.name}</Text>
-        <Text style={styles.configText}>Service: {DEVICE_CONFIG.serviceUUID}</Text>
+        <Text style={styles.configText}>Data Storage: React State (Option A)</Text>
+        <Text style={styles.configText}>Real-time Updates: Enabled</Text>
       </View>
     </ScrollView>
   );
@@ -699,6 +1057,40 @@ const styles = StyleSheet.create({
     color: 'white',
     fontSize: 16,
     fontWeight: '600',
+  },
+  recordingContainer: {
+    backgroundColor: '#4a1a1a',
+    padding: 15,
+    borderRadius: 10,
+    marginBottom: 20,
+    minWidth: 300,
+    borderWidth: 2,
+    borderColor: '#FF5722',
+  },
+  recordingTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#FF5722',
+    textAlign: 'center',
+    marginBottom: 10,
+  },
+  progressBar: {
+    height: 8,
+    backgroundColor: '#2a1a1a',
+    borderRadius: 4,
+    marginBottom: 8,
+    overflow: 'hidden',
+  },
+  progressFill: {
+    height: '100%',
+    backgroundColor: '#FF5722',
+    borderRadius: 4,
+  },
+  progressText: {
+    fontSize: 12,
+    color: '#FF5722',
+    textAlign: 'center',
+    fontWeight: 'bold',
   },
   errorContainer: {
     backgroundColor: '#2c1810',
@@ -847,6 +1239,59 @@ const styles = StyleSheet.create({
     marginRight: 8,
     minWidth: 70,
   },
+  analysisContainer: {
+    backgroundColor: '#1a2a2a',
+    padding: 15,
+    borderRadius: 10,
+    marginBottom: 20,
+    minWidth: 300,
+    borderWidth: 1,
+    borderColor: '#9C27B0',
+  },
+  analysisTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#9C27B0',
+    marginBottom: 10,
+    textAlign: 'center',
+  },
+  analysisItem: {
+    backgroundColor: '#2a1a2a',
+    padding: 10,
+    borderRadius: 8,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: '#9C27B0',
+  },
+  analysisHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  analysisSessionText: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#ECEDEE',
+  },
+  intensityBadge: {
+    fontSize: 10,
+    color: 'white',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    fontWeight: 'bold',
+  },
+  analysisStats: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 4,
+  },
+  analysisText: {
+    fontSize: 11,
+    color: '#9BA1A6',
+    fontFamily: 'monospace',
+  },
   historyContainer: {
     backgroundColor: '#2a2a1a',
     padding: 15,
@@ -868,11 +1313,12 @@ const styles = StyleSheet.create({
     color: '#9BA1A6',
   },
   clearButton: {
-    fontSize: 12,
-    color: '#FF5722',
-    padding: 5,
-    backgroundColor: '#2a1a1a',
-    borderRadius: 4,
+    backgroundColor: '#FF5722',
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginVertical: 8,
   },
   historyItem: {
     backgroundColor: '#1a1a1a',
@@ -926,5 +1372,47 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginBottom: 2,
     color: '#9BA1A6',
+  },
+  clearButtonText: {
+    fontSize: 12,
+    color: '#ECEDEE',
+    fontWeight: 'bold',
+  },
+  debugContainer: {
+    backgroundColor: '#1E1E1E',
+    padding: 16,
+    borderRadius: 12,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#333333',
+    minWidth: 300,
+  },
+  debugTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#FFFFFF',
+    marginBottom: 12,
+    textAlign: 'center',
+  },
+  debugText: {
+    fontSize: 14,
+    color: '#CCCCCC',
+    marginBottom: 4,
+  },
+  deviceList: {
+    marginTop: 8,
+    paddingLeft: 8,
+  },
+  debugButton: {
+    backgroundColor: '#0066CC',
+    padding: 8,
+    borderRadius: 6,
+    marginTop: 8,
+    alignItems: 'center',
+  },
+  debugButtonText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '600',
   },
 });

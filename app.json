@@ -15,7 +15,12 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.alberto.cole.abracadabra-app"
+      "bundleIdentifier": "com.alberto.cole.abracadabra-app",
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "This app uses Bluetooth to connect to your Arduino device for gesture control.",
+        "NSBluetoothPeripheralUsageDescription": "This app uses Bluetooth to connect to your Arduino device for gesture control.",
+        "NSLocationWhenInUseUsageDescription": "This app uses location to improve Bluetooth device discovery."
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -26,7 +31,10 @@
       "permissions": [
         "android.permission.BLUETOOTH",
         "android.permission.BLUETOOTH_ADMIN",
-        "android.permission.BLUETOOTH_CONNECT"
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION"
       ]
     },
     "web": {
