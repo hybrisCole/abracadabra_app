@@ -1,7 +1,8 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { StyleSheet, Alert, Platform, ScrollView, Pressable, PermissionsAndroid } from 'react-native';
+import { StyleSheet, Alert, Platform, ScrollView, Pressable, PermissionsAndroid, Dimensions } from 'react-native';
 import { Text, View } from '@/components/Themed';
 import { BleManager } from 'react-native-ble-plx';
+import { LineChart } from 'react-native-chart-kit';
 
 // Arduino device configuration
 const DEVICE_CONFIG = {
@@ -28,6 +29,18 @@ interface BLEDataPoint {
   recordingHash: string;
 }
 
+interface RealtimeDataPoint {
+  time: number;
+  accMagnitude: number;
+  gyroMagnitude: number;
+  accX: number;
+  accY: number;
+  accZ: number;
+  gyroX: number;
+  gyroY: number;
+  gyroZ: number;
+}
+
 export default function TabOneScreen() {
   const [bleSupported, setBleSupported] = useState<boolean | null>(null);
   const [isScanning, setIsScanning] = useState(false);
@@ -40,6 +53,7 @@ export default function TabOneScreen() {
   const [manager, setManager] = useState<BleManager | null>(null);
   const [dataCharacteristic, setDataCharacteristic] = useState<any>(null);
   const [commandCharacteristic, setCommandCharacteristic] = useState<any>(null);
+  const [notificationSubscription, setNotificationSubscription] = useState<any>(null);
 
   // Data storage in React state
   const [currentSession, setCurrentSession] = useState<GestureSession | null>(null);
@@ -49,13 +63,18 @@ export default function TabOneScreen() {
   const [totalPacketsReceived, setTotalPacketsReceived] = useState(0);
   const [dataRate, setDataRate] = useState(0); // packets per second
   const [lastDataTime, setLastDataTime] = useState<number>(0);
-  const [isRecording, setIsRecording] = useState(false);
-  const [recordingProgress, setRecordingProgress] = useState(0);
 
   // New debug states
   const [permissionsGranted, setPermissionsGranted] = useState(false);
   const [scannedDevices, setScannedDevices] = useState<any[]>([]);
   const [debugMode, setDebugMode] = useState(true); // Enable debug mode by default
+
+  // Real-time graph data
+  const [realtimeData, setRealtimeData] = useState<RealtimeDataPoint[]>([]);
+  const maxGraphPoints = 50;
+
+  // Get screen dimensions for chart
+  const screenData = Dimensions.get('window');
 
   // Request necessary permissions for BLE
   const requestPermissions = async () => {
@@ -116,7 +135,7 @@ export default function TabOneScreen() {
     return () => clearInterval(interval);
   }, [connectedDevice, lastDataTime]);
 
-  // Data rate calculation and recording progress
+    // Data rate calculation
   useEffect(() => {
     const interval = setInterval(() => {
       const now = Date.now();
@@ -129,23 +148,13 @@ export default function TabOneScreen() {
       } else {
         setDataRate(0);
       }
-
-      // Update recording progress for active sessions
-      if (currentSession?.isActive) {
-        const elapsed = now - currentSession.startTime;
-        const estimatedDuration = 4000; // 4 seconds typical recording
-        const progress = Math.min((elapsed / estimatedDuration) * 100, 100);
-        setRecordingProgress(progress);
-      } else {
-        setRecordingProgress(0);
-      }
-    }, 100); // Update more frequently for smooth progress
+    }, 1000); // Update every second
 
     return () => clearInterval(interval);
   }, [lastDataTime, currentSession, sessionData]);
 
   useEffect(() => {
-    const initializeBLE = async () => {
+  const initializeBLE = async () => {
       console.log('🚀 Starting BLE initialization...');
       setScanStatus('Requesting permissions...');
       
@@ -158,8 +167,8 @@ export default function TabOneScreen() {
 
       try {
         console.log('🔵 Creating BLE Manager...');
-        const bleManager = new BleManager();
-        setManager(bleManager);
+      const bleManager = new BleManager();
+      setManager(bleManager);
         
         // Check BLE support
         bleManager.onStateChange((state) => {
@@ -168,16 +177,16 @@ export default function TabOneScreen() {
             setBleSupported(true);
             setScanStatus('Bluetooth ready');
             // Start scanning after a short delay
-            setTimeout(() => {
-              startDeviceScan(bleManager);
-            }, 1000);
+      setTimeout(() => {
+        startDeviceScan(bleManager);
+      }, 1000);
           } else {
             setBleSupported(false);
             setScanStatus(`Bluetooth state: ${state}`);
           }
         }, true);
-        
-      } catch (error) {
+      
+    } catch (error) {
         console.log('❌ BLE initialization error:', error);
         setScanStatus('BLE initialization failed');
       }
@@ -189,6 +198,17 @@ export default function TabOneScreen() {
     return () => {
       if (manager) {
         manager.stopDeviceScan();
+        
+        // Clean up notification subscription
+        if (notificationSubscription) {
+          try {
+            notificationSubscription.remove();
+            console.log('Notification subscription cleaned up on unmount');
+          } catch (cleanupError) {
+            console.log('Subscription cleanup error on unmount (non-critical):', cleanupError);
+          }
+        }
+        
         if (connectedDevice) {
           connectedDevice.cancelConnection();
         }
@@ -230,32 +250,43 @@ export default function TabOneScreen() {
     const totalSamples = sessionData.length;
     const duration = sessionData[sessionData.length - 1]?.timestamp - sessionData[0]?.timestamp;
     
-    // Calculate acceleration magnitudes
+    // Calculate acceleration magnitudes (handle potential NaN values)
     const accMagnitudes = sessionData.map(point => {
       const { acceleration } = point;
-      return Math.sqrt(acceleration.x * acceleration.x + acceleration.y * acceleration.y + acceleration.z * acceleration.z);
+      const magnitude = Math.sqrt(acceleration.x * acceleration.x + acceleration.y * acceleration.y + acceleration.z * acceleration.z);
+      return isNaN(magnitude) ? 0 : magnitude;
     });
     
-    // Calculate gyroscope magnitudes
+    // Calculate gyroscope magnitudes (handle potential NaN values)
     const gyroMagnitudes = sessionData.map(point => {
       const { gyroscope } = point;
-      return Math.sqrt(gyroscope.x * gyroscope.x + gyroscope.y * gyroscope.y + gyroscope.z * gyroscope.z);
+      const magnitude = Math.sqrt(gyroscope.x * gyroscope.x + gyroscope.y * gyroscope.y + gyroscope.z * gyroscope.z);
+      return isNaN(magnitude) ? 0 : magnitude;
     });
     
-    // Basic statistics
-    const avgAccelMagnitude = accMagnitudes.reduce((a, b) => a + b, 0) / accMagnitudes.length;
-    const avgGyroMagnitude = gyroMagnitudes.reduce((a, b) => a + b, 0) / gyroMagnitudes.length;
-    const maxAccelMagnitude = Math.max(...accMagnitudes);
-    const maxGyroMagnitude = Math.max(...gyroMagnitudes);
+    // Basic statistics with fallback for edge cases
+    const avgAccelMagnitude = accMagnitudes.length > 0 ? accMagnitudes.reduce((a, b) => a + b, 0) / accMagnitudes.length : 0;
+    const avgGyroMagnitude = gyroMagnitudes.length > 0 ? gyroMagnitudes.reduce((a, b) => a + b, 0) / gyroMagnitudes.length : 0;
+    const maxAccelMagnitude = accMagnitudes.length > 0 ? Math.max(...accMagnitudes) : 0;
+    const maxGyroMagnitude = gyroMagnitudes.length > 0 ? Math.max(...gyroMagnitudes) : 0;
+    
+    // Calculate sampling rate with proper fallback
+    let samplingRate = 0;
+    if (duration > 0 && totalSamples > 1) {
+      samplingRate = (totalSamples / (duration / 1000));
+    } else if (totalSamples > 1) {
+      // Fallback: estimate based on sample count and assume ~4 second recording
+      samplingRate = totalSamples / 4.0;
+    }
     
     return {
       totalSamples,
       duration,
-      avgAccelMagnitude: avgAccelMagnitude.toFixed(3),
-      maxAccelMagnitude: maxAccelMagnitude.toFixed(3),
-      avgGyroMagnitude: avgGyroMagnitude.toFixed(1),
-      maxGyroMagnitude: maxGyroMagnitude.toFixed(1),
-      samplingRate: ((totalSamples / (duration / 1000)) || 0).toFixed(1)
+      avgAccelMagnitude: isNaN(avgAccelMagnitude) ? "0.000" : avgAccelMagnitude.toFixed(3),
+      maxAccelMagnitude: isNaN(maxAccelMagnitude) ? "0.000" : maxAccelMagnitude.toFixed(3),
+      avgGyroMagnitude: isNaN(avgGyroMagnitude) ? "0.0" : avgGyroMagnitude.toFixed(1),
+      maxGyroMagnitude: isNaN(maxGyroMagnitude) ? "0.0" : maxGyroMagnitude.toFixed(1),
+      samplingRate: isNaN(samplingRate) ? "0.0" : samplingRate.toFixed(1)
     };
   };
 
@@ -370,6 +401,10 @@ export default function TabOneScreen() {
       const subscription = dataChar.monitor((error: any, characteristic: any) => {
         if (error) {
           console.log('Notification error:', error);
+          // Don't show error if device was disconnected - this is expected
+          if (!error.message?.includes('disconnected') && !error.message?.includes('cancelled')) {
+            console.error('Unexpected notification error:', error);
+          }
           return;
         }
 
@@ -378,17 +413,29 @@ export default function TabOneScreen() {
         }
       });
 
+      setNotificationSubscription(subscription);
       console.log('Data notifications subscribed successfully');
 
       // Set up connection monitoring
       connectedDevice.onDisconnected((error: any, device: any) => {
         console.log('Device disconnected:', device?.id, error);
+        
+        // Clean up subscription to prevent "Operation was cancelled" errors
+        if (notificationSubscription) {
+          try {
+            notificationSubscription.remove();
+            console.log('Notification subscription cleaned up');
+          } catch (cleanupError) {
+            console.log('Subscription cleanup error (non-critical):', cleanupError);
+          }
+          setNotificationSubscription(null);
+        }
+        
         setConnectedDevice(null);
         setDataCharacteristic(null);
         setCommandCharacteristic(null);
         setConnectionStatus('Disconnected');
         setConnectionQuality('Unknown');
-        setIsRecording(false);
         
         // Clear current session on disconnect
         if (currentSession?.isActive) {
@@ -493,7 +540,7 @@ export default function TabOneScreen() {
       const gyroX = dataView.getInt16(12, true) / 10.0; // Convert back from scaled int
       const gyroY = dataView.getInt16(14, true) / 10.0;
       const gyroZ = dataView.getInt16(16, true) / 10.0;
-      const recordingHash = dataView.getUint32(16, true); // Note: overlaps with gyroZ
+      const recordingHash = dataView.getUint32(16, true); // This overlaps with gyroZ - will fix Arduino code later
 
       // Handle different packet types
       if (packetType === 0x01) {
@@ -510,7 +557,6 @@ export default function TabOneScreen() {
         
         setCurrentSession(newSession);
         setSessionData([]);
-        setIsRecording(true);
         
       } else if (packetType === 0x02) {
         // SENSOR_DATA packet
@@ -524,6 +570,34 @@ export default function TabOneScreen() {
         
         setLatestDataPoint(dataPoint);
         setSessionData(prev => [...prev, dataPoint]);
+        setLastDataTime(Date.now());
+        setTotalPacketsReceived(prev => prev + 1);
+        
+        // Calculate magnitudes for real-time visualization
+        const accMagnitude = Math.sqrt(accX * accX + accY * accY + accZ * accZ);
+        const gyroMagnitude = Math.sqrt(gyroX * gyroX + gyroY * gyroY + gyroZ * gyroZ);
+        
+        // Add to real-time graph data
+        const realtimePoint: RealtimeDataPoint = {
+          time: Date.now(),
+          accMagnitude,
+          gyroMagnitude,
+          accX,
+          accY,
+          accZ,
+          gyroX,
+          gyroY,
+          gyroZ
+        };
+        
+        setRealtimeData(prev => {
+          const newData = [...prev, realtimePoint];
+          // Keep only the last maxGraphPoints data points
+          if (newData.length > maxGraphPoints) {
+            return newData.slice(-maxGraphPoints);
+          }
+          return newData;
+        });
         
         // Update session sample count
         if (currentSession?.isActive) {
@@ -535,7 +609,7 @@ export default function TabOneScreen() {
         
         // Log occasionally to avoid spam
         if (sampleId % 50 === 0) {
-          console.log(`Sample ${sampleId}: Acc=[${accX.toFixed(2)}, ${accY.toFixed(2)}, ${accZ.toFixed(2)}] Gyro=[${gyroX.toFixed(1)}, ${gyroY.toFixed(1)}, ${gyroZ.toFixed(1)}]`);
+          console.log(`Sample ${sampleId}: Acc=[${accX.toFixed(2)}, ${accY.toFixed(2)}, ${accZ.toFixed(2)}] Gyro=[${gyroX.toFixed(1)}, ${gyroY.toFixed(1)}, ${gyroZ.toFixed(1)}] AccMag=${accMagnitude.toFixed(2)}`);
         }
         
       } else if (packetType === 0x03) {
@@ -549,8 +623,6 @@ export default function TabOneScreen() {
             isActive: false 
           } : null);
         }
-        
-        setIsRecording(false);
         
         // Analyze the session data
         const analysis = analyzeGesture(sessionData);
@@ -638,13 +710,13 @@ export default function TabOneScreen() {
           // Check if this is our Arduino device by name
           if (device.name === DEVICE_CONFIG.name) {
             console.log('✅ Found Arduino device:', device.name);
-            setFoundDevice(device);
-            setScanStatus(`Found ${device.name}!`);
-            
-            // Stop scanning
-            bleManager.stopDeviceScan();
+          setFoundDevice(device);
+          setScanStatus(`Found ${device.name}!`);
+          
+          // Stop scanning
+          bleManager.stopDeviceScan();
             clearTimeout(scanTimeout);
-            setIsScanning(false);
+          setIsScanning(false);
 
             // Update manager state and connect to device immediately
             setManager(bleManager);
@@ -718,6 +790,17 @@ export default function TabOneScreen() {
   const disconnectDevice = async () => {
     if (connectedDevice) {
       try {
+        // Clean up subscription first
+        if (notificationSubscription) {
+          try {
+            notificationSubscription.remove();
+            console.log('Notification subscription cleaned up');
+          } catch (cleanupError) {
+            console.log('Subscription cleanup error (non-critical):', cleanupError);
+          }
+          setNotificationSubscription(null);
+        }
+        
         await connectedDevice.cancelConnection();
         console.log('Device disconnected successfully');
       } catch (error) {
@@ -731,8 +814,17 @@ export default function TabOneScreen() {
     setTotalPacketsReceived(0);
     setCurrentSession(null);
     setLatestDataPoint(null);
-    setIsRecording(false);
-    setRecordingProgress(0);
+    
+    // Also clean up notification subscription if exists
+    if (notificationSubscription) {
+      try {
+        notificationSubscription.remove();
+        console.log('Notification subscription cleaned up');
+      } catch (cleanupError) {
+        console.log('Subscription cleanup error (non-critical):', cleanupError);
+      }
+      setNotificationSubscription(null);
+    }
   };
 
   const getConnectionStatusColor = () => {
@@ -754,7 +846,6 @@ export default function TabOneScreen() {
   const getStatusIcon = () => {
     if (bleSupported === false) return '⚠️';
     if (connectedDevice) {
-      if (isRecording) return '🔴'; // Recording indicator
       switch (connectionQuality) {
         case 'Excellent': return '📶';
         case 'Good': return '📶';
@@ -770,7 +861,6 @@ export default function TabOneScreen() {
 
   const getCurrentStatus = () => {
     if (connectedDevice) {
-      if (isRecording) return `Recording... (${connectionQuality} signal)`;
       return `${connectionStatus} (${connectionQuality})`;
     }
     if (isConnecting) return 'Connecting to device...';
@@ -829,17 +919,22 @@ export default function TabOneScreen() {
     }
   };
 
-  return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.contentContainer}>
+    return (
+    <ScrollView 
+      style={styles.container} 
+      contentContainerStyle={styles.contentContainer}
+      contentInsetAdjustmentBehavior="automatic"
+      showsVerticalScrollIndicator={true}
+    >
       <Text style={styles.title}>Abracadabra App</Text>
       
-      {/* Real-time Connection Status */}
+      {/* 1. Connected and Ready */}
       <View style={[styles.statusContainer, { backgroundColor: getConnectionStatusColor() }]}>
         <Text style={styles.statusIcon}>{getStatusIcon()}</Text>
         <Text style={styles.statusText}>{getCurrentStatus()}</Text>
       </View>
 
-      {/* Debug Information */}
+      {/* 2. Debug Information */}
       {debugMode && (
         <View style={styles.debugContainer}>
           <Text style={styles.debugTitle}>🔧 Debug Information</Text>
@@ -868,60 +963,89 @@ export default function TabOneScreen() {
         </View>
       )}
 
-      {/* Recording Status Indicator */}
-      {isRecording && (
-        <View style={styles.recordingContainer}>
-          <Text style={styles.recordingTitle}>🔴 RECORDING IN PROGRESS</Text>
-          <View style={styles.progressBar}>
-            <View style={[styles.progressFill, { width: `${recordingProgress}%` }]} />
+      {/* 3. Real-time IMU Data */}
+      {connectedDevice && realtimeData.length > 10 && (
+        <View style={styles.graphContainer}>
+          <View style={styles.graphHeader}>
+            <Text style={styles.graphTitle}>📈 Real-time IMU Data</Text>
           </View>
-          <Text style={styles.progressText}>{Math.round(recordingProgress)}% Complete</Text>
-        </View>
-      )}
-
-      {bleSupported === false && (
-        <View style={styles.errorContainer}>
-          <Text style={styles.errorTitle}>Bluetooth Not Available</Text>
-          <Text style={styles.errorText}>
-            This app requires native Bluetooth access. You're likely running in Expo Go.
-          </Text>
-          <Text 
-            style={styles.linkText} 
-            onPress={buildDevelopmentBuild}
-          >
-            📱 How to create development build
-          </Text>
-        </View>
-      )}
-
-      {!isScanning && !foundDevice && !connectedDevice && bleSupported && (
-        <View style={styles.retryContainer}>
-          <Text 
-            style={styles.retryButton} 
-            onPress={retryScanning}
-          >
-            🔄 Retry Scanning
-          </Text>
-        </View>
-      )}
-
-      {connectedDevice && (
-        <View style={styles.deviceInfo}>
-          <Text style={styles.deviceTitle}>Connected Device:</Text>
-          <Text style={styles.deviceText}>Name: {connectedDevice.name}</Text>
-          <Text style={styles.deviceText}>MAC: {connectedDevice.id}</Text>
-          <Text style={styles.deviceText}>Quality: {connectionQuality}</Text>
           
-          <Text 
-            style={styles.disconnectButton} 
-            onPress={disconnectDevice}
+          <ScrollView 
+            horizontal 
+            showsHorizontalScrollIndicator={false}
+            style={styles.chartScrollView}
           >
-            🔌 Disconnect
-          </Text>
+            <LineChart
+              data={{
+                labels: realtimeData.slice(-20).map((_, index) => (index % 5 === 0 ? `${index}` : '')),
+                datasets: [
+                  {
+                    data: realtimeData.slice(-20).map(point => point.accMagnitude),
+                    color: (opacity = 1) => `rgba(255, 99, 132, ${opacity})`, // Red for acceleration
+                    strokeWidth: 2
+                  },
+                  {
+                    data: realtimeData.slice(-20).map(point => point.gyroMagnitude / 100), // Scale down gyro for visibility
+                    color: (opacity = 1) => `rgba(54, 162, 235, ${opacity})`, // Blue for gyroscope
+                    strokeWidth: 2
+                  }
+                ],
+                legend: ["Accel (g)", "Gyro (/100 dps)"]
+              }}
+              width={screenData.width - 40}
+              height={180}
+              yAxisLabel=""
+              yAxisSuffix=""
+              yAxisInterval={1}
+              chartConfig={{
+                backgroundColor: "#1e2328",
+                backgroundGradientFrom: "#1e2328",
+                backgroundGradientTo: "#1e2328",
+                decimalPlaces: 2,
+                color: (opacity = 1) => `rgba(255, 255, 255, ${opacity})`,
+                labelColor: (opacity = 1) => `rgba(255, 255, 255, ${opacity})`,
+                style: {
+                  borderRadius: 16
+                },
+                propsForDots: {
+                  r: "3",
+                  strokeWidth: "1",
+                  stroke: "#ffa726"
+                }
+              }}
+              bezier
+              style={{
+                marginVertical: 8,
+                borderRadius: 16
+              }}
+            />
+          </ScrollView>
+          
+          {latestDataPoint && (
+            <View style={styles.currentValues}>
+              <Text style={styles.currentTitle}>Current Values:</Text>
+              <View style={styles.valueRow}>
+                <Text style={styles.valueLabel}>Acc:</Text>
+                <Text style={styles.valueText}>
+                  X:{latestDataPoint.acceleration.x.toFixed(2)}g Y:{latestDataPoint.acceleration.y.toFixed(2)}g Z:{latestDataPoint.acceleration.z.toFixed(2)}g
+                </Text>
+              </View>
+              <View style={styles.valueRow}>
+                <Text style={styles.valueLabel}>Gyro:</Text>
+                <Text style={styles.valueText}>
+                  X:{latestDataPoint.gyroscope.x.toFixed(1)}° Y:{latestDataPoint.gyroscope.y.toFixed(1)}° Z:{latestDataPoint.gyroscope.z.toFixed(1)}°
+                </Text>
+              </View>
+              <View style={styles.valueRow}>
+                <Text style={styles.valueLabel}>Rate:</Text>
+                <Text style={styles.valueText}>{dataRate} samples/sec</Text>
+              </View>
+            </View>
+          )}
         </View>
       )}
 
-      {/* Live Sensor Data Display */}
+      {/* 4. Live Data Stream */}
       {connectedDevice && (
         <View style={styles.dataContainer}>
           <Text style={styles.dataTitle}>📊 Live Data Stream</Text>
@@ -973,6 +1097,79 @@ export default function TabOneScreen() {
         </View>
       )}
 
+      {/* 5. Connected Device */}
+      {connectedDevice && (
+        <View style={styles.deviceInfo}>
+          <Text style={styles.deviceTitle}>Connected Device:</Text>
+          <Text style={styles.deviceText}>Name: {connectedDevice.name}</Text>
+          <Text style={styles.deviceText}>MAC: {connectedDevice.id}</Text>
+          <Text style={styles.deviceText}>Quality: {connectionQuality}</Text>
+          
+          <Text 
+            style={styles.disconnectButton} 
+            onPress={disconnectDevice}
+          >
+            🔌 Disconnect
+          </Text>
+        </View>
+      )}
+
+      {/* 6. Clear All Data */}
+      <Pressable style={styles.clearButton} onPress={clearAllData}>
+        <Text style={styles.clearButtonText}>🗑️ Clear All Data</Text>
+      </Pressable>
+
+      {/* 7. Ready to Receive Gesture Data */}
+      <View style={styles.instructions}>
+        <Text style={styles.instructionText}>
+          {bleSupported === false 
+            ? '🔧 Create development build to use Bluetooth'
+            : connectedDevice 
+              ? '🎉 Ready to receive gesture data! Double-tap your Arduino to start recording.' 
+              : isConnecting
+                ? '⏳ Connecting to your Arduino device...'
+            : foundDevice 
+                  ? '📱 Device found, connecting automatically...'
+              : '⚡ Power on your Arduino device to connect'
+          }
+        </Text>
+      </View>
+
+      {/* 8. Configuration */}
+      <View style={styles.configInfo}>
+        <Text style={styles.configTitle}>Configuration:</Text>
+        <Text style={styles.configText}>Device: {DEVICE_CONFIG.name}</Text>
+        <Text style={styles.configText}>Data Storage: React State (Option A)</Text>
+        <Text style={styles.configText}>Real-time Updates: Enabled</Text>
+      </View>
+
+      {/* Error/Retry Sections */}
+      {bleSupported === false && (
+        <View style={styles.errorContainer}>
+          <Text style={styles.errorTitle}>Bluetooth Not Available</Text>
+          <Text style={styles.errorText}>
+            This app requires native Bluetooth access. You're likely running in Expo Go.
+          </Text>
+          <Text 
+            style={styles.linkText} 
+            onPress={buildDevelopmentBuild}
+          >
+            📱 How to create development build
+          </Text>
+        </View>
+      )}
+
+      {!isScanning && !foundDevice && !connectedDevice && bleSupported && (
+        <View style={styles.retryContainer}>
+          <Text 
+            style={styles.retryButton} 
+            onPress={retryScanning}
+          >
+            🔄 Retry Scanning
+          </Text>
+        </View>
+      )}
+
       {/* Session History */}
       {sessionHistory.length > 0 && (
         <View style={styles.historyContainer}>
@@ -993,35 +1190,6 @@ export default function TabOneScreen() {
           ))}
         </View>
       )}
-
-      {/* Clear Data Button */}
-      <Pressable style={styles.clearButton} onPress={clearAllData}>
-        <Text style={styles.clearButtonText}>🗑️ Clear All Data</Text>
-      </Pressable>
-
-      <View style={styles.instructions}>
-        <Text style={styles.instructionText}>
-          {bleSupported === false 
-            ? '🔧 Create development build to use Bluetooth'
-            : connectedDevice 
-              ? isRecording
-                ? '🔴 Recording in progress... Perform your gesture!'
-                : '🎉 Ready to receive gesture data! Double-tap your Arduino to start recording.' 
-              : isConnecting
-                ? '⏳ Connecting to your Arduino device...'
-                : foundDevice
-                  ? '📱 Device found, connecting automatically...'
-                  : '⚡ Power on your Arduino device to connect'
-          }
-        </Text>
-      </View>
-
-      <View style={styles.configInfo}>
-        <Text style={styles.configTitle}>Configuration:</Text>
-        <Text style={styles.configText}>Device: {DEVICE_CONFIG.name}</Text>
-        <Text style={styles.configText}>Data Storage: React State (Option A)</Text>
-        <Text style={styles.configText}>Real-time Updates: Enabled</Text>
-      </View>
     </ScrollView>
   );
 }
@@ -1034,6 +1202,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     padding: 20,
+    paddingBottom: 100, // Extra bottom padding to ensure content is above tab bar
   },
   title: {
     fontSize: 24,
@@ -1058,40 +1227,7 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
   },
-  recordingContainer: {
-    backgroundColor: '#4a1a1a',
-    padding: 15,
-    borderRadius: 10,
-    marginBottom: 20,
-    minWidth: 300,
-    borderWidth: 2,
-    borderColor: '#FF5722',
-  },
-  recordingTitle: {
-    fontSize: 16,
-    fontWeight: 'bold',
-    color: '#FF5722',
-    textAlign: 'center',
-    marginBottom: 10,
-  },
-  progressBar: {
-    height: 8,
-    backgroundColor: '#2a1a1a',
-    borderRadius: 4,
-    marginBottom: 8,
-    overflow: 'hidden',
-  },
-  progressFill: {
-    height: '100%',
-    backgroundColor: '#FF5722',
-    borderRadius: 4,
-  },
-  progressText: {
-    fontSize: 12,
-    color: '#FF5722',
-    textAlign: 'center',
-    fontWeight: 'bold',
-  },
+
   errorContainer: {
     backgroundColor: '#2c1810',
     padding: 15,
@@ -1414,5 +1550,56 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 12,
     fontWeight: '600',
+  },
+  graphContainer: {
+    backgroundColor: '#1E2328',
+    padding: 16,
+    borderRadius: 12,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#4CAF50',
+    minWidth: 300,
+  },
+  graphHeader: {
+    marginBottom: 12,
+  },
+  graphTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#4CAF50',
+    textAlign: 'center',
+  },
+  chartScrollView: {
+    maxHeight: 200,
+    marginVertical: 4,
+  },
+  currentValues: {
+    backgroundColor: '#2A2A2A',
+    padding: 12,
+    borderRadius: 8,
+    marginTop: 8,
+  },
+  currentTitle: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#4CAF50',
+    marginBottom: 8,
+  },
+  valueRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  valueLabel: {
+    fontSize: 12,
+    fontWeight: 'bold',
+    color: '#CCCCCC',
+    width: 40,
+  },
+  valueText: {
+    fontSize: 11,
+    color: '#FFFFFF',
+    fontFamily: 'monospace',
+    flex: 1,
   },
 });
