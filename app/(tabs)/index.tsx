@@ -970,56 +970,125 @@ export default function TabOneScreen() {
             <Text style={styles.graphTitle}>📈 Real-time IMU Data</Text>
           </View>
           
-          <ScrollView 
-            horizontal 
-            showsHorizontalScrollIndicator={false}
-            style={styles.chartScrollView}
-          >
-            <LineChart
-              data={{
-                labels: realtimeData.slice(-20).map((_, index) => (index % 5 === 0 ? `${index}` : '')),
-                datasets: [
-                  {
-                    data: realtimeData.slice(-20).map(point => point.accMagnitude),
-                    color: (opacity = 1) => `rgba(255, 99, 132, ${opacity})`, // Red for acceleration
-                    strokeWidth: 2
+          {/* Acceleration Chart */}
+          <View style={styles.chartSection}>
+            <Text style={styles.chartLabel}>🔴 Acceleration (g)</Text>
+            <ScrollView 
+              horizontal 
+              showsHorizontalScrollIndicator={false}
+              style={styles.chartScrollView}
+            >
+              <LineChart
+                data={{
+                  labels: realtimeData.slice(-20).map((_, index) => (index % 5 === 0 ? `${index}` : '')),
+                  datasets: [
+                    {
+                      data: realtimeData.slice(-20).map(point => point.accX),
+                      color: (opacity = 1) => `rgba(255, 99, 132, ${opacity})`, // Red for X
+                      strokeWidth: 2
+                    },
+                    {
+                      data: realtimeData.slice(-20).map(point => point.accY),
+                      color: (opacity = 1) => `rgba(75, 192, 192, ${opacity})`, // Teal for Y
+                      strokeWidth: 2
+                    },
+                    {
+                      data: realtimeData.slice(-20).map(point => point.accZ),
+                      color: (opacity = 1) => `rgba(153, 102, 255, ${opacity})`, // Purple for Z
+                      strokeWidth: 2
+                    }
+                  ],
+                  legend: ["Acc-X", "Acc-Y", "Acc-Z"]
+                }}
+                width={screenData.width - 40}
+                height={160}
+                yAxisLabel=""
+                yAxisSuffix="g"
+                yAxisInterval={1}
+                chartConfig={{
+                  backgroundColor: "#1e2328",
+                  backgroundGradientFrom: "#1e2328",
+                  backgroundGradientTo: "#1e2328",
+                  decimalPlaces: 2,
+                  color: (opacity = 1) => `rgba(255, 255, 255, ${opacity})`,
+                  labelColor: (opacity = 1) => `rgba(255, 255, 255, ${opacity})`,
+                  style: {
+                    borderRadius: 16
                   },
-                  {
-                    data: realtimeData.slice(-20).map(point => point.gyroMagnitude / 100), // Scale down gyro for visibility
-                    color: (opacity = 1) => `rgba(54, 162, 235, ${opacity})`, // Blue for gyroscope
-                    strokeWidth: 2
+                  propsForDots: {
+                    r: "2",
+                    strokeWidth: "1",
+                    stroke: "#ffa726"
                   }
-                ],
-                legend: ["Accel (g)", "Gyro (/100 dps)"]
-              }}
-              width={screenData.width - 40}
-              height={180}
-              yAxisLabel=""
-              yAxisSuffix=""
-              yAxisInterval={1}
-              chartConfig={{
-                backgroundColor: "#1e2328",
-                backgroundGradientFrom: "#1e2328",
-                backgroundGradientTo: "#1e2328",
-                decimalPlaces: 2,
-                color: (opacity = 1) => `rgba(255, 255, 255, ${opacity})`,
-                labelColor: (opacity = 1) => `rgba(255, 255, 255, ${opacity})`,
-                style: {
+                }}
+                bezier
+                style={{
+                  marginVertical: 8,
                   borderRadius: 16
-                },
-                propsForDots: {
-                  r: "3",
-                  strokeWidth: "1",
-                  stroke: "#ffa726"
-                }
-              }}
-              bezier
-              style={{
-                marginVertical: 8,
-                borderRadius: 16
-              }}
-            />
-          </ScrollView>
+                }}
+              />
+            </ScrollView>
+          </View>
+
+          {/* Gyroscope Chart */}
+          <View style={styles.chartSection}>
+            <Text style={styles.chartLabel}>🔵 Gyroscope (°/s)</Text>
+            <ScrollView 
+              horizontal 
+              showsHorizontalScrollIndicator={false}
+              style={styles.chartScrollView}
+            >
+              <LineChart
+                data={{
+                  labels: realtimeData.slice(-20).map((_, index) => (index % 5 === 0 ? `${index}` : '')),
+                  datasets: [
+                    {
+                      data: realtimeData.slice(-20).map(point => point.gyroX),
+                      color: (opacity = 1) => `rgba(255, 206, 84, ${opacity})`, // Yellow for X
+                      strokeWidth: 2
+                    },
+                    {
+                      data: realtimeData.slice(-20).map(point => point.gyroY),
+                      color: (opacity = 1) => `rgba(54, 162, 235, ${opacity})`, // Blue for Y
+                      strokeWidth: 2
+                    },
+                    {
+                      data: realtimeData.slice(-20).map(point => point.gyroZ),
+                      color: (opacity = 1) => `rgba(255, 159, 64, ${opacity})`, // Orange for Z
+                      strokeWidth: 2
+                    }
+                  ],
+                  legend: ["Gyro-X", "Gyro-Y", "Gyro-Z"]
+                }}
+                width={screenData.width - 40}
+                height={160}
+                yAxisLabel=""
+                yAxisSuffix="°/s"
+                yAxisInterval={1}
+                chartConfig={{
+                  backgroundColor: "#1e2328",
+                  backgroundGradientFrom: "#1e2328",
+                  backgroundGradientTo: "#1e2328",
+                  decimalPlaces: 1,
+                  color: (opacity = 1) => `rgba(255, 255, 255, ${opacity})`,
+                  labelColor: (opacity = 1) => `rgba(255, 255, 255, ${opacity})`,
+                  style: {
+                    borderRadius: 16
+                  },
+                  propsForDots: {
+                    r: "2",
+                    strokeWidth: "1",
+                    stroke: "#ffa726"
+                  }
+                }}
+                bezier
+                style={{
+                  marginVertical: 8,
+                  borderRadius: 16
+                }}
+              />
+            </ScrollView>
+          </View>
           
           {latestDataPoint && (
             <View style={styles.currentValues}>
@@ -1569,8 +1638,18 @@ const styles = StyleSheet.create({
     color: '#4CAF50',
     textAlign: 'center',
   },
+  chartSection: {
+    marginBottom: 12,
+  },
+  chartLabel: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#CCCCCC',
+    marginBottom: 8,
+    textAlign: 'center',
+  },
   chartScrollView: {
-    maxHeight: 200,
+    maxHeight: 180,
     marginVertical: 4,
   },
   currentValues: {
