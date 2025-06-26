@@ -3,6 +3,7 @@ import { StyleSheet, Alert, Platform, ScrollView, Pressable, PermissionsAndroid,
 import { Text, View } from '@/components/Themed';
 import { BleManager } from 'react-native-ble-plx';
 import { LineChart } from 'react-native-chart-kit';
+import { GestureAPI } from '@/services/GestureAPI';
 
 // Arduino device configuration
 const DEVICE_CONFIG = {
@@ -72,6 +73,10 @@ export default function TabOneScreen() {
   // Real-time graph data
   const [realtimeData, setRealtimeData] = useState<RealtimeDataPoint[]>([]);
   const maxGraphPoints = 50;
+  
+  // Analysis state
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [lastAnalysisResult, setLastAnalysisResult] = useState<string | null>(null);
 
   // Get screen dimensions for chart
   const screenData = Dimensions.get('window');
@@ -546,6 +551,7 @@ export default function TabOneScreen() {
       if (packetType === 0x01) {
         // SESSION_START packet
         console.log('🎬 Session start detected, Hash:', recordingHash.toString(16));
+        console.log('🔥 Double tap triggered - starting gesture recording session');
         
         const newSession: GestureSession = {
           id: recordingHash.toString(16),
@@ -557,6 +563,10 @@ export default function TabOneScreen() {
         
         setCurrentSession(newSession);
         setSessionData([]);
+        
+        // Clear previous analysis results when starting new session
+        setLastAnalysisResult(null);
+        setIsAnalyzing(false);
         
       } else if (packetType === 0x02) {
         // SENSOR_DATA packet
@@ -630,9 +640,32 @@ export default function TabOneScreen() {
         // Show session summary
         Alert.alert(
           '📊 Gesture Recording Complete!',
-          `✅ Duration: ${timestamp}ms\n✅ Samples: ${sampleId + 1}\n✅ Avg Acceleration: ${analysis?.avgAccelMagnitude || 'N/A'}g\n✅ Sampling Rate: ${analysis?.samplingRate || 'N/A'}Hz`,
+          `✅ Duration: ${timestamp}ms\n✅ Samples: ${sampleId + 1}\n✅ Avg Acceleration: ${analysis?.avgAccelMagnitude || 'N/A'}g\n✅ Sampling Rate: ${analysis?.samplingRate || 'N/A'}Hz\n\n🧠 Sending to ML model for analysis...`,
           [{ text: 'Great!' }]
         );
+
+        // Automatically call the gesture processing API
+        // Convert BLE data to API format and analyze
+        if (sessionData.length > 0) {
+          const recordingId = sessionData[0]?.recordingHash || 'unknown';
+          const apiData = GestureAPI.convertBLEDataToAPI(sessionData, recordingId);
+          
+          console.log('🚀 Starting gesture analysis...');
+          console.log(`📝 Recording ID: ${recordingId}`);
+          console.log(`📊 Total samples: ${sessionData.length}`);
+          console.log(`🔄 Converted to API format: ${apiData.length} data points`);
+          
+          // Run analysis asynchronously
+          setTimeout(() => {
+            GestureAPI.analyzeGesture(apiData, setIsAnalyzing, setLastAnalysisResult).catch(error => {
+              console.error('🔥 Failed to analyze gesture:', error);
+              setIsAnalyzing(false);
+              setLastAnalysisResult('Analysis failed');
+            });
+          }, 500); // Small delay to let the UI update
+        } else {
+          console.warn('⚠️ No session data available for analysis');
+        }
       }
       
     } catch (error) {
@@ -960,6 +993,40 @@ export default function TabOneScreen() {
           >
             <Text style={styles.debugButtonText}>Show Full Debug Info</Text>
           </Pressable>
+          <Pressable 
+            style={[styles.debugButton, { backgroundColor: '#FF9800' }]} 
+            onPress={async () => {
+              if (sessionData.length > 0) {
+                const recordingId = sessionData[0]?.recordingHash || 'test';
+                const apiData = GestureAPI.convertBLEDataToAPI(sessionData, recordingId);
+                await GestureAPI.analyzeGesture(apiData, setIsAnalyzing, setLastAnalysisResult);
+              } else {
+                Alert.alert('No Data', 'No session data available to test. Perform a gesture first.');
+              }
+            }}
+          >
+            <Text style={styles.debugButtonText}>🧠 Test API Analysis</Text>
+          </Pressable>
+        </View>
+      )}
+
+      {/* 2.5 Gesture Analysis Status */}
+      {(isAnalyzing || lastAnalysisResult) && (
+        <View style={styles.analysisStatusContainer}>
+          <Text style={styles.analysisStatusTitle}>🧠 ML Analysis</Text>
+          {isAnalyzing ? (
+            <View style={styles.analyzingContainer}>
+              <Text style={styles.analyzingText}>🔄 Analyzing gesture with ML model...</Text>
+              <Text style={styles.analyzingSubtext}>Sending data to gesture processing API</Text>
+            </View>
+          ) : lastAnalysisResult && (
+            <View style={styles.resultContainer}>
+              <Text style={styles.resultText}>
+                🎯 Result: <Text style={styles.resultValue}>{lastAnalysisResult}</Text>
+              </Text>
+              <Text style={styles.resultSubtext}>Analysis complete</Text>
+            </View>
+          )}
         </View>
       )}
 
@@ -1680,5 +1747,58 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontFamily: 'monospace',
     flex: 1,
+  },
+  analysisStatusContainer: {
+    backgroundColor: '#1a2a1e',
+    padding: 16,
+    borderRadius: 12,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#4CAF50',
+    minWidth: 300,
+  },
+  analysisStatusTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#4CAF50',
+    marginBottom: 12,
+    textAlign: 'center',
+  },
+  analyzingContainer: {
+    alignItems: 'center',
+    paddingVertical: 8,
+  },
+  analyzingText: {
+    fontSize: 14,
+    color: '#FFFFFF',
+    textAlign: 'center',
+    marginBottom: 4,
+  },
+  analyzingSubtext: {
+    fontSize: 12,
+    color: '#CCCCCC',
+    textAlign: 'center',
+    fontStyle: 'italic',
+  },
+  resultContainer: {
+    alignItems: 'center',
+    paddingVertical: 8,
+  },
+  resultText: {
+    fontSize: 14,
+    color: '#FFFFFF',
+    textAlign: 'center',
+    marginBottom: 4,
+  },
+  resultValue: {
+    fontSize: 16,
+    color: '#4CAF50',
+    fontWeight: 'bold',
+  },
+  resultSubtext: {
+    fontSize: 12,
+    color: '#CCCCCC',
+    textAlign: 'center',
+    fontStyle: 'italic',
   },
 });
